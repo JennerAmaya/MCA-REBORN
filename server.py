@@ -21,6 +21,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
+CODE_VERSION = "self-vocative-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -2266,6 +2267,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "ok": True,
+                    "code_version": CODE_VERSION,
                     "model": os.environ.get("OPENAI_MODEL", "gpt-5-nano"),
                     "prompt_mode": os.environ.get("MCA_PROMPT_MODE", "minimal"),
                     "raw_turns": env_bool("MCA_STORE_RAW_TURNS", False),
