@@ -133,7 +133,7 @@ MINIMAL_PROMPT = (
     "Sabes que vives en Minecraft, en un mundo de islas, aldeas, bloques, oficios, cuevas y mobs. "
     "El archipielago oceanico es trasfondo: no menciones mar, islas, olas ni tormentas salvo que sea relevante. "
     "Si el jugador pregunta que haces o a que te dedicas, responde con tu oficio real detectado; si no hay oficio claro, dilo sin inventar. "
-    "No digas que construyes, levantas puentes o haces obras si tu oficio no es cantero o no hay contexto claro de construccion. "
+    "No conviertas una tarea aislada, un recuerdo antiguo o una palabra suelta en tu profesion permanente. "
     "Puedes proponer microacciones de rol coherentes con tu oficio, familia o entorno, como pescar, mapear, cocinar, patrullar, abrazar o defender a alguien. "
     "Si hay noche, lluvia, trueno o peligro en el contexto, reaccionas al entorno; no inventes un monstruo presente como hecho seguro si no aparece en la escena. "
     "Ajusta tono por personalidad, humor, corazones, relacion y ordenes disponibles. "
@@ -303,6 +303,19 @@ def generate_npc_identity(world_id: str, character_id: str, villager_name: str, 
         f"suele {habits[(seed // 19) % len(habits)]}."
     )
     return compact_text(identity, env_int("MCA_NPC_IDENTITY_MAX_CHARS", 260))
+
+
+def sanitize_legacy_npc_identity(identity: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", identity.strip())
+    cleaned: list[str] = []
+    for sentence in sentences:
+        text = normalize_for_match(sentence)
+        if "su oficio lo inclina" in text:
+            continue
+        if re.search(r"\b(oficio|profesion|profession|job)\b", text):
+            continue
+        cleaned.append(sentence.strip())
+    return compact_text(" ".join(part for part in cleaned if part), env_int("MCA_NPC_IDENTITY_MAX_CHARS", 260))
 
 
 class MemoryStore:
@@ -538,7 +551,18 @@ class MemoryStore:
                 (ids["world_id"], ids["character_id"]),
             ).fetchone()
             if row and str(row[0]).strip():
-                return str(row[0])
+                identity = sanitize_legacy_npc_identity(str(row[0]))
+                if identity:
+                    if identity != str(row[0]):
+                        db.execute(
+                            """
+                            UPDATE npc_identities
+                            SET updated_at = ?, identity = ?
+                            WHERE world_id = ? AND character_id = ?
+                            """,
+                            (int(time.time()), identity, ids["world_id"], ids["character_id"]),
+                        )
+                    return identity
             identity = generate_npc_identity(
                 ids["world_id"], ids["character_id"], villager_name, system_text
             )
@@ -1188,7 +1212,11 @@ def apply_fallback_session_ids(
         fixed["world_id"] = stable_fallback_id("world", world_hint)
     if fixed.get("player_id") == "unknown_player" and player_name:
         fixed["player_id"] = stable_fallback_id("player", player_name)
-    if fixed.get("character_id") == "unknown_character" and villager_name:
+    if (
+        fixed.get("character_id") == "unknown_character"
+        and villager_name
+        and env_bool("MCA_ALLOW_NAME_FALLBACK_MEMORY", False)
+    ):
         profession = extract_current_profession(system_text) or "unknown_profession"
         fixed["character_id"] = stable_fallback_id("npc", f"{villager_name}:{profession}")
     return fixed
@@ -1209,14 +1237,6 @@ def extract_current_profession(system_text: str) -> str:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return PROFESSION_ALIASES.get(match.group(1), "")
-
-    found = {
-        PROFESSION_ALIASES[alias]
-        for alias in PROFESSION_ALIASES
-        if re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
-    }
-    if len(found) == 1:
-        return next(iter(found))
     return ""
 
 
@@ -1232,8 +1252,83 @@ def current_profession_guidance(system_text: str) -> str:
         f"Oficio actual detectado: {details['label']}. "
         f"Cuando el jugador pregunte a que te dedicas, di ese oficio y usa detalles de {details['activities']}. "
         "Este oficio actual manda sobre la identidad persistente y sobre recuerdos antiguos si hay conflicto. "
-        "No cambies de oficio ni digas que construyes puentes/obras salvo que ese oficio y el contexto lo justifiquen."
+        "No cambies de oficio por recuerdos antiguos, tareas ajenas o palabras sueltas del contexto."
     )
+
+
+def detect_age_state(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    if re.search(r"\btoddler\b", text):
+        return "toddler"
+    if re.search(r"\bchild\b", text):
+        return "child"
+    if re.search(r"\bteen\b", text):
+        return "teen"
+    return "adulto/no infantil si MCA no indica lo contrario"
+
+
+def self_awareness_context(
+    system_text: str,
+    villager_name: str,
+    player_name: str,
+    ids: dict[str, str],
+) -> str:
+    profession = extract_current_profession(system_text)
+    parts: list[str] = [
+        "Conciencia del NPC actual: estos datos describen al aldeano que esta hablando ahora y tienen prioridad sobre memorias antiguas."
+    ]
+    if villager_name:
+        parts.append(f"Nombre propio actual: {villager_name}; no lo repitas como muletilla.")
+    if player_name:
+        parts.append(f"Jugador actual: {player_name}.")
+    if ids.get("character_id") and ids["character_id"] != "unknown_character":
+        parts.append(f"ID unico del aldeano: {ids['character_id']}. Usa sus recuerdos como propios, no como recuerdos de otros NPC.")
+    else:
+        parts.append("MCA no envio ID unico del aldeano; no uses ni guardes recuerdos personales persistentes para evitar mezclar NPCs.")
+    if profession:
+        details = PROFESSION_DETAILS[profession]
+        parts.append(f"Oficio actual: {details['label']} ({details['activities']}).")
+    else:
+        parts.append("Oficio actual: no confirmado por MCA; no inventes oficio si te preguntan.")
+    parts.append(f"Edad/etapa detectada: {detect_age_state(system_text)}.")
+    parts.append(
+        "La personalidad, estado de animo, rasgos, relacion y entorno actuales vienen del contexto de MCA; obedecelos antes que cualquier recuerdo."
+    )
+    return " ".join(parts)
+
+
+CONSTRUCTION_MEMORY_TERMS = (
+    "cantero",
+    "mason",
+    "piedra",
+    "muro",
+    "muros",
+    "horno",
+    "hornos",
+    "ladrillo",
+    "ladrillos",
+    "construir",
+    "construccion",
+    "construcción",
+    "obra",
+    "obras",
+    "puente",
+    "puentes",
+    "reparar caminos",
+)
+
+
+def filter_facts_for_current_context(facts: list[str], profession: str) -> list[str]:
+    filtered: list[str] = []
+    for fact in facts:
+        text = normalize_for_match(fact)
+        is_assistant_task = text.startswith("el aldeano dijo que iba a hacer esto")
+        if not profession and is_assistant_task:
+            continue
+        if profession != "mason" and any(term in text for term in CONSTRUCTION_MEMORY_TERMS):
+            continue
+        filtered.append(fact)
+    return filtered
 
 
 def parse_session_ids(system_text: str) -> dict[str, str]:
@@ -1621,8 +1716,11 @@ def build_instructions(
     memory_context: str,
     family_context: str,
     village_context: str,
+    self_context: str,
 ) -> str:
     parts = [read_prompt()]
+    if self_context:
+        parts.append(self_context)
     parts.append(player_rule)
     if player_lore:
         parts.append(player_lore)
@@ -2019,6 +2117,8 @@ class Handler(BaseHTTPRequestHandler):
                     "family_entries": self.server.family.entry_count(),
                     "village_count": self.server.village.village_count(),
                     "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
+                    "shared_player_memory": env_bool("MCA_SHARED_PLAYER_MEMORY", False),
+                    "name_fallback_memory": env_bool("MCA_ALLOW_NAME_FALLBACK_MEMORY", False),
                     "max_player_facts": env_int("MCA_MAX_PLAYER_FACTS", 3),
                 }
             )
@@ -2113,11 +2213,20 @@ class Handler(BaseHTTPRequestHandler):
             last_user, ids.get("character_id"), ids.get("player_id")
         )
         recall_context = memory_question_context(last_user)
-        facts = self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4))
+        current_profession = extract_current_profession(system_text)
+        facts = filter_facts_for_current_context(
+            self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4)),
+            current_profession,
+        )
         npc_identity = self.server.memory.npc_identity(ids, registered_villager_name, system_text)
-        if player_lore:
+        shared_player_memory = env_bool("MCA_SHARED_PLAYER_MEMORY", False)
+        if player_lore and shared_player_memory:
             self.server.memory.add_player_fact(ids, player_lore, 9)
-        player_facts = self.server.memory.player_facts(ids, env_int("MCA_MAX_PLAYER_FACTS", 3))
+        player_facts = (
+            self.server.memory.player_facts(ids, env_int("MCA_MAX_PLAYER_FACTS", 3))
+            if shared_player_memory
+            else []
+        )
         instructions = build_instructions(
             system_text=system_text,
             facts=facts,
@@ -2133,6 +2242,7 @@ class Handler(BaseHTTPRequestHandler):
             memory_context=recall_context,
             family_context=family_context,
             village_context=village_context,
+            self_context=self_awareness_context(system_text, registered_villager_name, registered_player_name, ids),
         )
         text, error = call_openai_responses(
             api_key=api_key,
@@ -2166,7 +2276,8 @@ class Handler(BaseHTTPRequestHandler):
         text = correct_child_name_confusion(text, registered_player_name, player_child_names)
         for fact, weight in extract_important_facts(last_user, text):
             self.server.memory.add_fact(ids, fact, weight)
-            self.server.memory.add_player_fact(ids, fact, weight)
+            if shared_player_memory:
+                self.server.memory.add_player_fact(ids, fact, weight)
         for fact, weight in extract_assistant_facts(text):
             self.server.memory.add_fact(ids, fact, weight)
         self.server.memory.add_turn(ids, "user", last_user)
