@@ -8,7 +8,7 @@ No incluye claves reales. Debes configurar variables de entorno en el hosting.
 ## Requisitos
 
 - Python 3.10 o superior.
-- No requiere paquetes externos; usa solo librerias estandar de Python.
+- Instala `redis` desde `requirements.txt` si usaras memoria persistente en Redis.
 - Un puerto HTTP publico o una URL HTTPS publica.
 
 ## Archivos importantes
@@ -37,6 +37,13 @@ PROXY_PORT=8765
 PROXY_SHARED_TOKEN=pon_un_token_largo_random
 
 MCA_MEMORY_DB=memory.sqlite3
+MCA_MEMORY_BACKEND=redis
+MCA_REDIS_HOST=redis-xxxxx.example.redislabs.com
+MCA_REDIS_PORT=12345
+MCA_REDIS_USERNAME=default
+MCA_REDIS_PASSWORD=pon_la_clave_en_Render_no_en_GitHub
+MCA_REDIS_SSL=false
+MCA_REDIS_NAMESPACE=mca-reborn
 MCA_PROMPT_MODE=minimal
 MCA_CONTEXT_MESSAGES=2
 MCA_MAX_INPUT_CHARS=900
@@ -47,7 +54,9 @@ MCA_MAX_PLAYER_FACTS=3
 MCA_PLAYER_FACT_LIMIT=24
 MCA_SHARED_PLAYER_MEMORY=false
 MCA_ALLOW_NAME_FALLBACK_MEMORY=false
-MCA_STORE_RAW_TURNS=false
+MCA_STORE_RAW_TURNS=true
+MCA_RAW_TURN_LIMIT=10
+MCA_RECENT_TURN_CONTEXT=4
 MCA_INSTRUCTIONS_MAX_CHARS=5200
 MCA_DIRECT_COMMANDS_LOCAL=true
 MCA_DIRECT_COMMAND_MAX_CHARS=90
@@ -115,7 +124,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "mca-context-preserve-20260501"
+"code_version": "redis-memory-personality-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -125,9 +134,14 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - No subas `.env`, `api-keys.env`, `memory.sqlite3`, logs ni crash reports.
 - No dejes `PROXY_SHARED_TOKEN` vacio si el endpoint sera publico.
 - No pegues la API key en `config/mca.json`.
+- No subas `MCA_REDIS_PASSWORD` al repo. Configuralo solo como variable de
+  entorno en Render.
 - Mantener `MCA_MAX_SYSTEM_MESSAGE_CHARS`, `MCA_MAX_SYSTEM_CHARS` y
   `MCA_INSTRUCTIONS_MAX_CHARS` altos ayuda a que el proxy no pierda oficio,
   rasgos, personalidad, estado de animo ni relaciones enviados por MCA.
+- Con `MCA_MEMORY_BACKEND=redis`, los recuerdos se guardan por
+  `world_id + player_id + character_id`; un chiste o charla con un aldeano no
+  se mezcla con otro aldeano.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,

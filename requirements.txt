@@ -1,1 +1,1 @@
-# No external Python packages required
+redis>=5.0,<6

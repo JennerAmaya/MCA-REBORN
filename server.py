@@ -14,14 +14,20 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "mca-context-preserve-20260501"
+CODE_VERSION = "redis-memory-personality-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -264,6 +270,19 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def redis_key_part(value: str) -> str:
+    text = str(value or "unknown").strip() or "unknown"
+    readable = re.sub(r"[^a-zA-Z0-9_.-]+", "_", text)[:36].strip("_") or "id"
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
+
+
+def redis_namespace() -> str:
+    raw = os.environ.get("MCA_REDIS_NAMESPACE", "mca-reborn")
+    namespace = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("_")
+    return namespace or "mca-reborn"
+
+
 def read_prompt() -> str:
     if os.environ.get("MCA_PROMPT_MODE", "minimal").strip().lower() == "minimal":
         return MINIMAL_PROMPT
@@ -402,6 +421,8 @@ def sanitize_legacy_npc_identity(identity: str) -> str:
 
 
 class MemoryStore:
+    backend_name = "sqlite"
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -488,8 +509,14 @@ class MemoryStore:
                 """
             )
 
-    def connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+    @contextmanager
+    def connect(self) -> Any:
+        db = sqlite3.connect(self.path)
+        try:
+            yield db
+            db.commit()
+        finally:
+            db.close()
 
     def add_turn(self, ids: dict[str, str], role: str, content: str) -> None:
         if not env_bool("MCA_STORE_RAW_TURNS", False):
@@ -727,6 +754,273 @@ class MemoryStore:
                 keep,
             ),
         )
+
+
+class RedisMemoryStore:
+    backend_name = "redis"
+
+    def __init__(self, client: Any, namespace: str) -> None:
+        self.client = client
+        self.namespace = namespace
+        self.client.ping()
+
+    def _key(self, *parts: str) -> str:
+        return ":".join([self.namespace, *parts])
+
+    def _personal_parts(self, ids: dict[str, str]) -> list[str]:
+        return [
+            redis_key_part(ids.get("world_id", "unknown_world")),
+            redis_key_part(ids.get("player_id", "unknown_player")),
+            redis_key_part(ids.get("character_id", "unknown_character")),
+        ]
+
+    def _player_parts(self, ids: dict[str, str]) -> list[str]:
+        return [
+            redis_key_part(ids.get("world_id", "unknown_world")),
+            redis_key_part(ids.get("player_id", "unknown_player")),
+        ]
+
+    def _has_personal_ids(self, ids: dict[str, str]) -> bool:
+        return (
+            ids.get("world_id") != "unknown_world"
+            and ids.get("player_id") != "unknown_player"
+            and ids.get("character_id") != "unknown_character"
+        )
+
+    def _fact_score(self, weight: int, updated_at: int) -> int:
+        return max(weight, 0) * 10_000_000_000 + updated_at
+
+    def add_turn(self, ids: dict[str, str], role: str, content: str) -> None:
+        if not env_bool("MCA_STORE_RAW_TURNS", False) or not self._has_personal_ids(ids):
+            return
+        content = compact_text(content, env_int("MCA_RAW_TURN_MAX_CHARS", 700))
+        if not content:
+            return
+        key = self._key("turns", *self._personal_parts(ids))
+        item = json.dumps(
+            {"ts": int(time.time()), "role": role, "content": content},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            pipe = self.client.pipeline()
+            pipe.rpush(key, item)
+            pipe.ltrim(key, -env_int("MCA_RAW_TURN_LIMIT", 12), -1)
+            pipe.execute()
+        except Exception as exc:
+            print(f"[memory redis] add_turn failed: {exc}")
+
+    def recent_turns(self, ids: dict[str, str], limit: int) -> list[tuple[str, str]]:
+        if limit <= 0 or not env_bool("MCA_STORE_RAW_TURNS", False) or not self._has_personal_ids(ids):
+            return []
+        key = self._key("turns", *self._personal_parts(ids))
+        try:
+            rows = self.client.lrange(key, -limit, -1)
+        except Exception as exc:
+            print(f"[memory redis] recent_turns failed: {exc}")
+            return []
+        turns: list[tuple[str, str]] = []
+        for row in rows:
+            try:
+                item = json.loads(row)
+            except (TypeError, ValueError):
+                continue
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "")
+            if role and content:
+                turns.append((role, content))
+        return turns
+
+    def add_fact(self, ids: dict[str, str], fact: str, weight: int = 1) -> None:
+        if not self._has_personal_ids(ids):
+            return
+        fact = compact_text(fact, 220)
+        if not fact:
+            return
+        fact_hash = hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()
+        now = int(time.time())
+        zkey = self._key("facts", *self._personal_parts(ids))
+        hkey = self._key("factdata", *self._personal_parts(ids))
+        try:
+            old_raw = self.client.hget(hkey, fact_hash)
+            if old_raw:
+                old = json.loads(old_raw)
+                weight = max(int(old.get("weight", 1)), weight)
+            payload = json.dumps(
+                {"fact": fact, "weight": weight, "updated_at": now},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            pipe = self.client.pipeline()
+            pipe.hset(hkey, fact_hash, payload)
+            pipe.zadd(zkey, {fact_hash: self._fact_score(weight, now)})
+            pipe.execute()
+            self._prune_fact_hash(zkey, hkey, env_int("MCA_FACT_LIMIT", 24))
+        except Exception as exc:
+            print(f"[memory redis] add_fact failed: {exc}")
+
+    def essential_facts(self, ids: dict[str, str], limit: int) -> list[str]:
+        if limit <= 0 or not self._has_personal_ids(ids):
+            return []
+        zkey = self._key("facts", *self._personal_parts(ids))
+        hkey = self._key("factdata", *self._personal_parts(ids))
+        try:
+            fact_hashes = self.client.zrevrange(zkey, 0, limit - 1)
+            rows = self.client.hmget(hkey, fact_hashes) if fact_hashes else []
+        except Exception as exc:
+            print(f"[memory redis] essential_facts failed: {exc}")
+            return []
+        facts: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            try:
+                fact = str(json.loads(row).get("fact") or "")
+            except (TypeError, ValueError):
+                continue
+            if fact:
+                facts.append(fact)
+        return facts
+
+    def add_player_fact(self, ids: dict[str, str], fact: str, weight: int = 1) -> None:
+        if ids.get("world_id") == "unknown_world" or ids.get("player_id") == "unknown_player":
+            return
+        fact = compact_text(fact, 220)
+        if not fact:
+            return
+        fact_hash = hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()
+        now = int(time.time())
+        zkey = self._key("player_facts", *self._player_parts(ids))
+        hkey = self._key("player_factdata", *self._player_parts(ids))
+        try:
+            old_raw = self.client.hget(hkey, fact_hash)
+            if old_raw:
+                old = json.loads(old_raw)
+                weight = max(int(old.get("weight", 1)), weight)
+            payload = json.dumps(
+                {"fact": fact, "weight": weight, "updated_at": now},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            pipe = self.client.pipeline()
+            pipe.hset(hkey, fact_hash, payload)
+            pipe.zadd(zkey, {fact_hash: self._fact_score(weight, now)})
+            pipe.execute()
+            self._prune_fact_hash(zkey, hkey, env_int("MCA_PLAYER_FACT_LIMIT", 24))
+        except Exception as exc:
+            print(f"[memory redis] add_player_fact failed: {exc}")
+
+    def player_facts(self, ids: dict[str, str], limit: int) -> list[str]:
+        if limit <= 0 or ids.get("world_id") == "unknown_world" or ids.get("player_id") == "unknown_player":
+            return []
+        zkey = self._key("player_facts", *self._player_parts(ids))
+        hkey = self._key("player_factdata", *self._player_parts(ids))
+        try:
+            fact_hashes = self.client.zrevrange(zkey, 0, limit - 1)
+            rows = self.client.hmget(hkey, fact_hashes) if fact_hashes else []
+        except Exception as exc:
+            print(f"[memory redis] player_facts failed: {exc}")
+            return []
+        facts: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            try:
+                fact = str(json.loads(row).get("fact") or "")
+            except (TypeError, ValueError):
+                continue
+            if fact:
+                facts.append(fact)
+        return facts
+
+    def npc_identity(self, ids: dict[str, str], villager_name: str, system_text: str) -> str:
+        if not env_bool("MCA_NPC_IDENTITIES", True):
+            return ""
+        if ids.get("world_id") == "unknown_world" or ids.get("character_id") == "unknown_character":
+            return ""
+        key = self._key(
+            "npc_identity",
+            redis_key_part(ids.get("world_id", "unknown_world")),
+            redis_key_part(ids.get("character_id", "unknown_character")),
+        )
+        try:
+            existing = self.client.get(key)
+            if existing and str(existing).strip():
+                identity = sanitize_legacy_npc_identity(str(existing))
+                if identity:
+                    if identity != str(existing):
+                        self.client.set(key, identity)
+                    return identity
+            identity = generate_npc_identity(
+                ids["world_id"], ids["character_id"], villager_name, system_text
+            )
+            self.client.set(key, identity)
+            return identity
+        except Exception as exc:
+            print(f"[memory redis] npc_identity failed: {exc}")
+            return ""
+
+    def _prune_fact_hash(self, zkey: str, hkey: str, keep: int) -> None:
+        extra = self.client.zcard(zkey) - max(keep, 0)
+        if extra > 0:
+            old_hashes = self.client.zrange(zkey, 0, extra - 1)
+            if old_hashes:
+                pipe = self.client.pipeline()
+                pipe.zrem(zkey, *old_hashes)
+                pipe.hdel(hkey, *old_hashes)
+                pipe.execute()
+        current = set(self.client.zrange(zkey, 0, -1))
+        stored = set(self.client.hkeys(hkey))
+        stale = list(stored - current)
+        if stale:
+            self.client.hdel(hkey, *stale)
+
+
+def redis_client_from_env() -> Any:
+    if redis_lib is None:
+        raise RuntimeError("redis package is not installed")
+    redis_url = os.environ.get("REDIS_URL") or os.environ.get("MCA_REDIS_URL")
+    timeout = env_int("MCA_REDIS_TIMEOUT_SECONDS", 5)
+    if redis_url:
+        return redis_lib.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
+        )
+    host = os.environ.get("MCA_REDIS_HOST") or os.environ.get("REDIS_HOST")
+    if not host:
+        raise RuntimeError("missing REDIS_HOST or MCA_REDIS_HOST")
+    return redis_lib.Redis(
+        host=host,
+        port=env_int("MCA_REDIS_PORT", env_int("REDIS_PORT", 6379)),
+        db=env_int("MCA_REDIS_DB", env_int("REDIS_DB", 0)),
+        username=os.environ.get("MCA_REDIS_USERNAME") or os.environ.get("REDIS_USERNAME") or None,
+        password=os.environ.get("MCA_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD") or None,
+        ssl=env_bool("MCA_REDIS_SSL", env_bool("REDIS_SSL", False)),
+        decode_responses=True,
+        socket_timeout=timeout,
+        socket_connect_timeout=timeout,
+    )
+
+
+def create_memory_store(db_path: Path) -> Any:
+    backend = os.environ.get("MCA_MEMORY_BACKEND", "").strip().lower()
+    redis_configured = bool(
+        os.environ.get("REDIS_URL")
+        or os.environ.get("MCA_REDIS_URL")
+        or os.environ.get("REDIS_HOST")
+        or os.environ.get("MCA_REDIS_HOST")
+    )
+    if backend == "redis" or (not backend and redis_configured):
+        try:
+            store = RedisMemoryStore(redis_client_from_env(), redis_namespace())
+            print(f"[memory] using Redis backend namespace={store.namespace!r}")
+            return store
+        except Exception as exc:
+            print(f"[memory] Redis unavailable, falling back to SQLite: {exc}")
+    print(f"[memory] using SQLite backend at {db_path}")
+    return MemoryStore(db_path)
 
 
 class NbtReader:
@@ -1785,8 +2079,12 @@ def personality_guidance(system_text: str) -> str:
         hints.append("greedy: interesado y oportunista; piensa en favores, regalos y ganancia.")
     if "gloomy" in text or "sensitive" in text or "anxious" in text:
         hints.append("gloomy/sensitive/anxious: vulnerable, sensible, inseguro; responde mas suave, sumiso o herido.")
-    if "flirty" in text:
-        hints.append("flirty: coqueto y calido; con vinculo alto puede ser meloso, con vinculo bajo solo juega un poco.")
+    if "flirty" in text or "coquet" in text:
+        relation = relationship_temperature_guidance(system_text)
+        hints.append(
+            "flirty/coqueta: que se note en voz, picardia y confianza corporal; no lo reduzcas a oficio ni a orden. "
+            + (relation or "Con vinculo bajo coquetea ligero y con limites; con vinculo alto puede ser mas dulce y cercana.")
+        )
     if "friendly" in text or "upbeat" in text or "extroverted" in text or "playful" in text:
         hints.append("friendly/upbeat/playful: abierto, expresivo y con humor.")
     if "introverted" in text or "relaxed" in text or "peaceful" in text:
@@ -1802,6 +2100,9 @@ def personality_guidance(system_text: str) -> str:
         or ("likes" in text and "really well" in text)
     ):
         hints.append("vinculo fuerte: prioriza carino, lealtad y proteccion antes que brusquedad.")
+    relation = relationship_temperature_guidance(system_text)
+    if relation and not any(relation in hint for hint in hints):
+        hints.append(relation)
     if not hints:
         return ""
     return "Guia de personalidad detectada: " + " ".join(hints[:3])
@@ -1922,6 +2223,57 @@ def relationship_roleplay_guidance(family_context: str, system_text: str, player
     return "Vinculos de rol: " + " ".join(parts)
 
 
+def relationship_score_from_system(system_text: str) -> int | None:
+    text = normalize_for_match(system_text)
+    patterns = [
+        r"\b(-?\d+)\s*(?:hearts?|corazones?)\b",
+        r"\b(?:hearts?|corazones?)\s*(?:is|=|:)?\s*(-?\d+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    if "hates" in text or "dislikes" in text or "odia" in text:
+        return -25
+    if "likes" in text and "really well" in text:
+        return 80
+    if "married to" in text or "engaged with" in text or "in love with" in text:
+        return 100
+    return None
+
+
+def relationship_temperature_guidance(system_text: str) -> str:
+    score = relationship_score_from_system(system_text)
+    text = normalize_for_match(system_text)
+    if score is not None:
+        if score < 0:
+            return "Relacion actual: corazones negativos o rechazo; muestra distancia, filo o desconfianza aunque seas amable o coqueta."
+        if score < 25:
+            return "Relacion actual: confianza baja; puedes ser jugueton o educado, pero no actues como pareja ni como amigo intimo."
+        if score >= 80:
+            return "Relacion actual: confianza muy alta; permite mas carino, complicidad y proteccion si la personalidad lo permite."
+    if "hates" in text or "dislikes" in text:
+        return "Relacion actual: mala; no seas servicial por defecto y deja notar fastidio o distancia."
+    return ""
+
+
+def response_focus_context(last_user: str, system_text: str) -> str:
+    text = normalize_for_match(last_user)
+    if re.search(r"\b(personalidad|caracter|como\s+eres|que\s+tipo\s+de\s+persona|rasgos?)\b", text):
+        relation = relationship_temperature_guidance(system_text)
+        return (
+            "Enfoque de respuesta: el jugador pregunta por tu personalidad o caracter. "
+            "Responde desde tu personalidad, estado de animo, rasgos y relacion actual; el oficio solo puede ser un detalle secundario. "
+            "Si MCA indica flirty/coqueta/coqueto, debe sentirse en el tono: jugueton, directo y con encanto. "
+            "Si la relacion es baja o negativa, ese coqueteo debe sonar distante, mordaz o provocador, no entregado ni romantico. "
+            + relation
+        ).strip()
+    return ""
+
+
 def memory_question_context(last_user: str) -> str:
     text = normalize_for_match(last_user)
     if re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text):
@@ -1930,6 +2282,20 @@ def memory_question_context(last_user: str) -> str:
             "lore o familia; si falta memoria, admitelo sin inventar hechos concretos."
         )
     return ""
+
+
+def recent_turns_context(turns: list[tuple[str, str]]) -> str:
+    if not turns:
+        return ""
+    lines: list[str] = []
+    for role, content in turns[-env_int("MCA_RECENT_TURN_CONTEXT", 4) :]:
+        label = "Jugador" if role == "user" else "Aldeano"
+        lines.append(f"{label}: {compact_text(content, 180)}")
+    return (
+        "Conversacion reciente recordada con este mismo aldeano y jugador. "
+        "Usala como memoria de continuidad si encaja, sin recitarla completa:\n"
+        + "\n".join(lines)
+    )
 
 
 def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[str, int]]:
@@ -1942,6 +2308,7 @@ def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[s
         (r"\b(me llamo|mi nombre es|me gusta|odio|amo|tengo miedo|prefiero)\b", 8),
         (r"\b(te amo|te quiero|bes[eoé]|abrazo|casad[oa]|espos[ao]|novi[ao]|prometid[ao]|enamorad[oa]|anillo|boda)\b", 7),
         (r"\b(regalo|te di|me diste|diamante|flor|vino|taberna|tesoro)\b", 5),
+        (r"\b(chiste|broma|bromee|bromeamos|reimos|reir|risa|gracios[oa]|joke)\b", 7),
         (r"\b(perdon|perd[oó]n|pelea|golpe|traicion|salvaste|rescataste|promet[ií])\b", 6),
         (r"\b(isla|barco|naufragio|ruina|kraken|leviathan|leviat[aá]n|oceano|oc[eé]ano)\b", 4),
     ]
@@ -1996,32 +2363,28 @@ def build_instructions(
     npc_identity: str,
     player_rule: str,
     player_name: str,
+    focus_context: str,
     command_hint: str,
     claim_context: str,
     memory_context: str,
+    recent_context: str,
     family_context: str,
     village_context: str,
     self_context: str,
     name_reference_context: str,
 ) -> str:
-    parts = [read_prompt()]
+    parts: list[str] = []
     if self_context:
         parts.append(self_context)
     if name_reference_context:
         parts.append(name_reference_context)
     parts.append(player_rule)
+    if focus_context:
+        parts.append(focus_context)
     if player_lore:
         parts.append(player_lore)
     if mentioned_lore:
         parts.append(mentioned_lore)
-    if profile:
-        parts.append("Perfil del aldeano por nombre: " + profile)
-    if npc_identity:
-        parts.append(
-            "Identidad persistente del aldeano: "
-            + npc_identity
-            + " Usala como trasfondo; no la recites como ficha."
-        )
     parts.append(current_profession_guidance(system_text))
     temperament = personality_guidance(system_text)
     if temperament:
@@ -2035,10 +2398,27 @@ def build_instructions(
     relation_guidance = relationship_roleplay_guidance(family_context, system_text, player_name)
     if relation_guidance:
         parts.append(relation_guidance)
-    if claim_context:
-        parts.append(claim_context)
     if memory_context:
         parts.append(memory_context)
+    if recent_context:
+        parts.append(recent_context)
+    if facts:
+        parts.append("Memoria esencial:\n" + "\n".join(f"- {fact}" for fact in facts))
+    if player_facts:
+        parts.append(
+            "Memoria general del jugador compartida por la aldea:\n"
+            + "\n".join(f"- {fact}" for fact in player_facts)
+        )
+    if profile:
+        parts.append("Perfil del aldeano por nombre: " + profile)
+    if npc_identity:
+        parts.append(
+            "Identidad persistente del aldeano: "
+            + npc_identity
+            + " Usala como trasfondo; no la recites como ficha."
+        )
+    if claim_context:
+        parts.append(claim_context)
     if family_context:
         parts.append(
             family_context
@@ -2054,13 +2434,7 @@ def build_instructions(
         parts.append(command_hint)
     if system_text:
         parts.append("Contexto breve enviado por MCA:\n" + sanitize_system_text(system_text))
-    if player_facts:
-        parts.append(
-            "Memoria general del jugador compartida por la aldea:\n"
-            + "\n".join(f"- {fact}" for fact in player_facts)
-        )
-    if facts:
-        parts.append("Memoria esencial:\n" + "\n".join(f"- {fact}" for fact in facts))
+    parts.append("Reglas generales de estilo y formato:\n" + read_prompt())
     instructions = "\n\n".join(part for part in parts if part.strip())
     return compact_text(instructions, max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200))
 
@@ -2414,6 +2788,8 @@ class Handler(BaseHTTPRequestHandler):
                     "max_output_tokens": env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
                     "reasoning_effort": os.environ.get("OPENAI_REASONING_EFFORT", ""),
                     "text_verbosity": os.environ.get("OPENAI_TEXT_VERBOSITY", ""),
+                    "memory_backend": getattr(self.server.memory, "backend_name", "unknown"),
+                    "redis_namespace": getattr(self.server.memory, "namespace", ""),
                     "max_system_message_chars": max(env_int("MCA_MAX_SYSTEM_MESSAGE_CHARS", 12000), 12000),
                     "max_system_chars": max(env_int("MCA_MAX_SYSTEM_CHARS", 6000), 6000),
                     "instructions_max_chars": max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200),
@@ -2543,10 +2919,14 @@ class Handler(BaseHTTPRequestHandler):
             last_user, ids.get("character_id"), ids.get("player_id")
         )
         recall_context = memory_question_context(last_user)
+        focus_context = response_focus_context(last_user, system_text)
         current_profession = extract_current_profession(system_text)
         facts = filter_facts_for_current_context(
             self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4)),
             current_profession,
+        )
+        recent_context = recent_turns_context(
+            self.server.memory.recent_turns(ids, env_int("MCA_RECENT_TURN_CONTEXT", 4))
         )
         npc_identity = self.server.memory.npc_identity(ids, registered_villager_name, system_text)
         shared_player_memory = env_bool("MCA_SHARED_PLAYER_MEMORY", False)
@@ -2567,9 +2947,11 @@ class Handler(BaseHTTPRequestHandler):
             npc_identity=npc_identity,
             player_rule=player_name_rule(player_name),
             player_name=player_name,
+            focus_context=focus_context,
             command_hint=command_hint,
             claim_context=claim_context,
             memory_context=recall_context,
+            recent_context=recent_context,
             family_context=family_context,
             village_context=village_context,
             self_context=self_awareness_context(system_text, registered_villager_name, registered_player_name, ids),
@@ -2645,7 +3027,7 @@ def main() -> None:
     data_dir_raw = os.environ.get("MCA_WORLD_DATA_DIR", "../../world/data")
     data_dir = (ROOT / data_dir_raw).resolve()
     server = Server((host, port), Handler)
-    server.memory = MemoryStore(db_path)
+    server.memory = create_memory_store(db_path)
     server.family = FamilyTreeCache(data_dir)
     server.village = VillageCache(data_dir)
     server.recent_debug = deque(maxlen=RECENT_DEBUG_LIMIT)
