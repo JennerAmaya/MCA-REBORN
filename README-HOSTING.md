@@ -61,6 +61,8 @@ MCA_PLAYER_LORE=profiles/player_lore.json
 MCA_PLAYER_LORE_MAX_CHARS=360
 MCA_NPC_IDENTITIES=true
 MCA_NPC_IDENTITY_MAX_CHARS=260
+MCA_DEBUG_RECENT=false
+MCA_DEBUG_INCLUDE_SYSTEM=true
 ```
 
 Si el hosting asigna el puerto con una variable `PORT`, usa ese valor como

@@ -10,14 +10,17 @@ import struct
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+RECENT_DEBUG_LIMIT = 20
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -1331,6 +1334,32 @@ def filter_facts_for_current_context(facts: list[str], profession: str) -> list[
     return filtered
 
 
+def request_debug_snapshot(
+    ids: dict[str, str],
+    villager_name: str,
+    player_name: str,
+    system_text: str,
+    last_user: str,
+) -> dict[str, Any]:
+    profession = extract_current_profession(system_text)
+    data: dict[str, Any] = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "villager_name": villager_name,
+        "player_name": player_name,
+        "world_id": ids.get("world_id", ""),
+        "player_id": ids.get("player_id", ""),
+        "character_id": ids.get("character_id", ""),
+        "profession": profession or "",
+        "age_state": detect_age_state(system_text),
+        "has_real_character_id": ids.get("character_id") != "unknown_character",
+        "last_user_excerpt": compact_text(last_user, 120),
+        "system_excerpt": compact_text(sanitize_system_text(system_text), 900)
+        if env_bool("MCA_DEBUG_INCLUDE_SYSTEM", True)
+        else "",
+    }
+    return data
+
+
 def parse_session_ids(system_text: str) -> dict[str, str]:
     ids = {
         "world_id": "unknown_world",
@@ -1396,6 +1425,20 @@ def split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
         conversation = conversation[-keep_messages:] if keep_messages else []
     system_text = compact_text("\n".join(system_parts), env_int("MCA_MAX_SYSTEM_CHARS", 2800))
     return system_text, conversation, last_user, villager_name, player_name
+
+
+def extract_names_from_system(system_text: str) -> tuple[str, str]:
+    patterns = [
+        r"villager named\s+(.+?)\s+and the Player named\s+(.+?)(?:\.|$)",
+        r"aldean[oa]\s+llamad[oa]\s+(.+?)\s+y\s+(?:el\s+)?jugador\s+llamad[oa]\s+(.+?)(?:\.|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, system_text, re.IGNORECASE)
+        if match:
+            villager = compact_text(match.group(1).strip(" ,;:"), 80)
+            player = compact_text(match.group(2).strip(" ,;:"), 80)
+            return villager, player
+    return "", ""
 
 
 def sanitize_system_text(system_text: str) -> str:
@@ -2093,8 +2136,19 @@ class Handler(BaseHTTPRequestHandler):
             token = authorization
         return token == expected
 
+    def authorized_query_or_header(self, parsed: urllib.parse.ParseResult) -> bool:
+        if self.authorized():
+            return True
+        expected = os.environ.get("PROXY_SHARED_TOKEN", "").strip()
+        if not expected:
+            return True
+        query = urllib.parse.parse_qs(parsed.query)
+        return (query.get("token") or [""])[0].strip() == expected
+
     def do_GET(self) -> None:
-        if self.path in ("", "/"):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path in ("", "/"):
             self.send_json(
                 {
                     "ok": True,
@@ -2104,7 +2158,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if self.path == "/health":
+        if path == "/health":
             self.send_json(
                 {
                     "ok": True,
@@ -2119,9 +2173,19 @@ class Handler(BaseHTTPRequestHandler):
                     "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
                     "shared_player_memory": env_bool("MCA_SHARED_PLAYER_MEMORY", False),
                     "name_fallback_memory": env_bool("MCA_ALLOW_NAME_FALLBACK_MEMORY", False),
+                    "debug_recent_enabled": env_bool("MCA_DEBUG_RECENT", False),
                     "max_player_facts": env_int("MCA_MAX_PLAYER_FACTS", 3),
                 }
             )
+            return
+        if path == "/debug/recent":
+            if not env_bool("MCA_DEBUG_RECENT", False):
+                self.send_json({"error": "debug_disabled"}, status=404)
+                return
+            if not self.authorized_query_or_header(parsed):
+                self.send_json({"error": "unauthorized"}, status=401)
+                return
+            self.send_json({"recent": list(self.server.recent_debug)})
             return
         self.send_json({"error": "not_found"}, status=404)
 
@@ -2148,8 +2212,21 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = get_messages(payload)
         system_text, input_messages, last_user, villager_name, player_name = split_messages(messages)
+        system_villager_name, system_player_name = extract_names_from_system(system_text)
+        villager_name = villager_name or system_villager_name
+        player_name = player_name or system_player_name
         ids = parse_session_ids(system_text)
         ids = apply_fallback_session_ids(ids, villager_name, player_name, system_text)
+        debug_snapshot = request_debug_snapshot(ids, villager_name, player_name, system_text, last_user)
+        self.server.recent_debug.appendleft(debug_snapshot)
+        print(
+            "[MCA request] "
+            f"villager={debug_snapshot['villager_name']!r} "
+            f"player={debug_snapshot['player_name']!r} "
+            f"profession={debug_snapshot['profession']!r} "
+            f"character_id={debug_snapshot['character_id']!r} "
+            f"has_real_character_id={debug_snapshot['has_real_character_id']}"
+        )
         if env_bool("OPENAI_ALLOW_REQUEST_MODEL", False):
             model = str(payload.get("model") or os.environ.get("OPENAI_MODEL", "gpt-5.4-nano"))
         else:
@@ -2300,6 +2377,7 @@ class Server(ThreadingHTTPServer):
     memory: MemoryStore
     family: FamilyTreeCache
     village: VillageCache
+    recent_debug: deque[dict[str, Any]]
 
 
 def main() -> None:
@@ -2314,6 +2392,7 @@ def main() -> None:
     server.memory = MemoryStore(db_path)
     server.family = FamilyTreeCache(data_dir)
     server.village = VillageCache(data_dir)
+    server.recent_debug = deque(maxlen=RECENT_DEBUG_LIMIT)
     print(f"MCA roleplay proxy escuchando en http://{host}:{port}/v1/chat/completions")
     print(f"Modelo configurado: {os.environ.get('OPENAI_MODEL', 'gpt-5.4-nano')}")
     print(f"Modo prompt: {os.environ.get('MCA_PROMPT_MODE', 'minimal')}")
