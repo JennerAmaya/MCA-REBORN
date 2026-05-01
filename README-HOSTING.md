@@ -28,7 +28,8 @@ OPENAI_MODEL=gpt-5.4-nano
 OPENAI_ALLOW_REQUEST_MODEL=false
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_STORE_RESPONSES=false
-OPENAI_MAX_OUTPUT_TOKENS=90
+OPENAI_MAX_OUTPUT_TOKENS=220
+OPENAI_MIN_OUTPUT_TOKENS=180
 OPENAI_REASONING_EFFORT=none
 OPENAI_TEXT_VERBOSITY=low
 
@@ -58,6 +59,7 @@ MCA_STORE_RAW_TURNS=true
 MCA_RAW_TURN_LIMIT=10
 MCA_RECENT_TURN_CONTEXT=4
 MCA_INSTRUCTIONS_MAX_CHARS=5200
+MCA_RESPONSE_MAX_CHARS=0
 MCA_DIRECT_COMMANDS_LOCAL=true
 MCA_DIRECT_COMMAND_MAX_CHARS=90
 MCA_FAMILY_CONTEXT=true
@@ -124,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "relationship-command-memory-20260501"
+"code_version": "clean-long-messages-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -148,6 +150,11 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - Los comandos mecanicos solo se ejecutan con orden directa. Una conversacion
   normal no debe devolver `follow-player`; para seguir debe existir una frase
   explicita como `sigueme`, `ven conmigo` o `acompaname`.
+- `OPENAI_MIN_OUTPUT_TOKENS` fuerza un minimo aunque Render conserve una
+  variable vieja mas baja; esto evita respuestas cortadas por falta de tokens.
+- `MCA_RESPONSE_MAX_CHARS=0` significa no recortar la respuesta en el proxy. Si
+  MCA/Minecraft muestran un limite visual, se puede poner un numero aqui para
+  cortar al final de una frase.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,

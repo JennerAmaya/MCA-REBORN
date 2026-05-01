@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "relationship-command-memory-20260501"
+CODE_VERSION = "clean-long-messages-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -218,6 +218,7 @@ MINIMAL_PROMPT = (
     "Si el jugador usa tu nombre en una orden, normalmente te esta llamando a ti, no nombrando a otro objetivo. "
     "No digas el nombre ni apodo del jugador como muletilla; usalo solo si el jugador lo pide, si corriges identidad, familia o lore, o si la frase realmente lo necesita. "
     "No uses emojis, caritas, asteriscos ni formato de accion entre asteriscos. "
+    "El mensaje final debe ser texto limpio y legible: sin llaves, backticks, simbolos sueltos, codigo, listas raras ni fragmentos de JSON dentro del dialogo. "
     "Sabes que vives en Minecraft, en un mundo de islas, aldeas, bloques, oficios, cuevas y mobs. "
     "El archipielago oceanico es trasfondo: no menciones mar, islas, olas ni tormentas salvo que sea relevante. "
     "Si el jugador pregunta que haces o a que te dedicas, responde con tu oficio real detectado; si no hay oficio claro, dilo sin inventar. "
@@ -238,7 +239,7 @@ MINIMAL_PROMPT = (
     "No repitas el nombre del jugador en cada respuesta. "
     "Nunca olvides que el nombre propio actual eres tu; no hables de tu propio nombre como si fuera otra persona. "
     "Romance solo adultos y con consentimiento; evita odio por identidad y sexo grafico. "
-    "Si MCA pide JSON, responde solo JSON valido."
+    "Si MCA pide JSON, responde solo JSON valido con message limpio y optionalCommand; no mezcles texto fuera del JSON."
 )
 
 
@@ -273,6 +274,12 @@ def env_int(name: str, default: int) -> int:
 def raw_turn_memory_enabled() -> bool:
     default = os.environ.get("MCA_MEMORY_BACKEND", "").strip().lower() == "redis"
     return env_bool("MCA_STORE_RAW_TURNS", default)
+
+
+def output_token_limit() -> int:
+    requested = env_int("OPENAI_MAX_OUTPUT_TOKENS", 220)
+    minimum = env_int("OPENAI_MIN_OUTPUT_TOKENS", 180)
+    return max(requested, minimum)
 
 
 def redis_key_part(value: str) -> str:
@@ -2764,6 +2771,68 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def extract_malformed_message(text: str) -> str:
+    cleaned = text.strip().strip("`")
+    patterns = [
+        r'"message"\s*:\s*"([^"]*)',
+        r"'message'\s*:\s*'([^']*)",
+        r"\bmessage\s*[:=]\s*(.*?)(?:,\s*(?:optionalCommand|optional_command|command)\s*[:=]|[}\n]|$)",
+        r'"answer"\s*:\s*"([^"]*)',
+        r"\banswer\s*[:=]\s*(.*?)(?:,\s*(?:optionalCommand|optional_command|command)\s*[:=]|[}\n]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return str(match.group(1)).strip(" \t\r\n\"'")
+    return ""
+
+
+def repair_common_mojibake(text: str) -> str:
+    replacements = {
+        "Â¿": "¿",
+        "Â¡": "¡",
+        "Ã¡": "á",
+        "Ã©": "é",
+        "Ã­": "í",
+        "Ã³": "ó",
+        "Ãº": "ú",
+        "Ã±": "ñ",
+        "Ã¼": "ü",
+        "Ã": "Á",
+        "Ã‰": "É",
+        "Ã": "Í",
+        "Ã“": "Ó",
+        "Ãš": "Ú",
+        "Ã‘": "Ñ",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text
+
+
+def strip_json_artifacts(text: str) -> str:
+    text = re.sub(r"```(?:json)?|```", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:optionalCommand|optional_command|command|message|answer)\s*[:=]\s*", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:null|none|true|false)\b\s*,?", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[{}\[\]`|^~\\]+", " ", text)
+    text = re.sub(r"(?:[+=_/<>#]{2,}|[-=+_]{3,})", " ", text)
+    text = re.sub(r"\s*[,;:]\s*(?=$)", "", text)
+    return text
+
+
+def limit_dialogue_length(text: str) -> str:
+    limit = env_int("MCA_RESPONSE_MAX_CHARS", 0)
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    cut = text[: limit - 3].rstrip()
+    sentence_end = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if sentence_end >= max(20, limit // 3):
+        return cut[: sentence_end + 1].strip()
+    return cut + "..."
+
+
 def looks_like_refusal(text: str) -> bool:
     lowered = normalize_for_match(text)
     return any(
@@ -2808,9 +2877,14 @@ def user_allows_player_name(last_user: str, player_name: str) -> bool:
 
 
 def clean_dialogue_style(text: str) -> str:
+    text = repair_common_mojibake(text)
+    text = strip_json_artifacts(text)
     text = text.replace("*", "")
     text = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"([¿¡])\s+", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n\"' ,;:-")
+    return limit_dialogue_length(text)
 
 
 def clean_self_name_mentions(text: str, villager_name: str, last_user: str) -> str:
@@ -2928,7 +3002,7 @@ def normalize_mca_response(
 
     data = extract_json_object(text)
     if data is None:
-        data = {"message": text, "command": ""}
+        data = {"message": extract_malformed_message(text) or text, "command": ""}
 
     message = clean_player_address(str(data.get("message") or data.get("answer") or text), player_name)
     message = clean_dialogue_style(
@@ -3004,7 +3078,8 @@ class Handler(BaseHTTPRequestHandler):
                     "model": os.environ.get("OPENAI_MODEL", "gpt-5-nano"),
                     "prompt_mode": os.environ.get("MCA_PROMPT_MODE", "minimal"),
                     "raw_turns": raw_turn_memory_enabled(),
-                    "max_output_tokens": env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
+                    "max_output_tokens": output_token_limit(),
+                    "response_max_chars": env_int("MCA_RESPONSE_MAX_CHARS", 0),
                     "reasoning_effort": os.environ.get("OPENAI_REASONING_EFFORT", ""),
                     "text_verbosity": os.environ.get("OPENAI_TEXT_VERBOSITY", ""),
                     "memory_backend": getattr(self.server.memory, "backend_name", "unknown"),
@@ -3185,7 +3260,7 @@ class Handler(BaseHTTPRequestHandler):
             model=model,
             instructions=instructions,
             input_messages=input_messages,
-            max_output_tokens=env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
+            max_output_tokens=output_token_limit(),
             store=env_bool("OPENAI_STORE_RESPONSES", False),
         )
         if error:
