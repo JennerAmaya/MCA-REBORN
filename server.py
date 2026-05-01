@@ -131,6 +131,7 @@ MINIMAL_PROMPT = (
     "No termines siempre con preguntas. "
     "Para continuar una charla, usa reaccion, opinion, recuerdo o una pregunta breve solo cuando encaje. "
     "No menciones tu propio nombre salvo que el jugador te lo pregunte; no saludes repitiendo tu nombre. "
+    "Si el jugador usa tu nombre en una orden, normalmente te esta llamando a ti, no nombrando a otro objetivo. "
     "No digas el nombre ni apodo del jugador como muletilla; usalo solo si el jugador lo pide, si corriges identidad, familia o lore, o si la frase realmente lo necesita. "
     "No uses emojis, caritas, asteriscos ni formato de accion entre asteriscos. "
     "Sabes que vives en Minecraft, en un mundo de islas, aldeas, bloques, oficios, cuevas y mobs. "
@@ -151,6 +152,7 @@ MINIMAL_PROMPT = (
     "Puedes rolear intenciones o acciones en primera persona como abrazar, cocinar, amenazar o defender, aunque no siempre sean acciones mecanicas reales. "
     "Responde al ultimo mensaje del jugador como si lo estuvieras escuchando, sin cambiar de tema porque si. "
     "No repitas el nombre del jugador en cada respuesta. "
+    "Nunca olvides que el nombre propio actual eres tu; no hables de tu propio nombre como si fuera otra persona. "
     "Romance solo adultos y con consentimiento; evita odio por identidad y sexo grafico. "
     "Si MCA pide JSON, responde solo JSON valido."
 )
@@ -1297,7 +1299,106 @@ def self_awareness_context(
     parts.append(
         "La personalidad, estado de animo, rasgos, relacion y entorno actuales vienen del contexto de MCA; obedecelos antes que cualquier recuerdo."
     )
+    state_lines = current_mca_state_lines(system_text, villager_name)
+    if state_lines:
+        parts.append("Ficha actual textual enviada por MCA: " + " ".join(state_lines))
     return " ".join(parts)
+
+
+def current_mca_state_lines(system_text: str, villager_name: str) -> list[str]:
+    if not system_text:
+        return []
+    normalized_name = normalize_for_match(villager_name)
+    lines: list[str] = []
+    for raw in re.split(r"(?<=[.!?])\s+", system_text):
+        sentence = compact_text(raw, 220).strip()
+        if not sentence:
+            continue
+        text = normalize_for_match(sentence)
+        if sentence.startswith("["):
+            continue
+        if (
+            (normalized_name and normalized_name in text)
+            or text.startswith("it is ")
+            or "$villager" in text
+        ):
+            lines.append(sentence)
+        if len(lines) >= 8:
+            break
+    return lines
+
+
+def user_message_uses_own_name_as_vocative(text: str, villager_name: str) -> bool:
+    if not text or not villager_name:
+        return False
+    commandish = normalize_for_match(text)
+    if not re.search(
+        r"\b(pegale|pega|golpea|ataca|atacale|mata|matalo|matalos|defiende|ayuda|sigueme|seguime|ven|quedate|espera|ponte|quita|vete|comerci)\b",
+        commandish,
+    ):
+        return False
+    for pattern in loose_name_patterns(villager_name):
+        if not re.search(rf"\b{pattern}\b", text, flags=re.IGNORECASE):
+            continue
+        if re.search(rf"\b(?:a|al|contra|hacia|sobre)\s+{pattern}\b", text, flags=re.IGNORECASE):
+            return False
+        if re.search(rf"^\s*{pattern}\b", text, flags=re.IGNORECASE):
+            return True
+        if re.search(rf"\b{pattern}\s*[.!?]?\s*$", text, flags=re.IGNORECASE):
+            return True
+        if re.search(rf"[,;:]\s*{pattern}\b|\b{pattern}\s*[,;:]", text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def strip_own_name_vocative(text: str, villager_name: str) -> str:
+    if not user_message_uses_own_name_as_vocative(text, villager_name):
+        return text
+    fixed = text
+    for pattern in loose_name_patterns(villager_name):
+        fixed = re.sub(rf"^\s*{pattern}\s*[,;:\-]?\s*", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(rf"\s*[,;:\-]?\s*{pattern}\s*[.!?]?\s*$", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(rf"\s+{pattern}\s+", " ", fixed, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", fixed).strip(" ,;:-") or text
+
+
+def rewrite_vocative_messages(
+    messages: list[dict[str, str]],
+    villager_name: str,
+) -> tuple[list[dict[str, str]], str, bool]:
+    rewritten: list[dict[str, str]] = []
+    last_user = ""
+    changed = False
+    for message in messages:
+        copied = dict(message)
+        if copied.get("role") == "user":
+            original = copied.get("content", "")
+            cleaned = strip_own_name_vocative(original, villager_name)
+            if cleaned != original:
+                copied["content"] = cleaned
+                changed = True
+            last_user = copied.get("content", "")
+        rewritten.append(copied)
+    return rewritten, last_user, changed
+
+
+def self_name_reference_guidance(original_last_user: str, model_last_user: str, villager_name: str) -> str:
+    if not villager_name:
+        return ""
+    if user_message_uses_own_name_as_vocative(original_last_user, villager_name):
+        return (
+            f"Interpretacion del ultimo mensaje: el jugador uso '{villager_name}' como llamada/vocativo. "
+            f"{villager_name} eres tu, no otra persona ni el objetivo. "
+            f"Lee '{original_last_user}' como si dijera '{model_last_user}'. "
+            "Si era una orden de combate, entiende que quiere que ayudes contra el enemigo visible o la amenaza del contexto; no respondas que no vas a pegarle a ti mismo."
+        )
+    for pattern in loose_name_patterns(villager_name):
+        if re.search(rf"\b(?:a|al|contra|hacia|sobre)\s+{pattern}\b", original_last_user, flags=re.IGNORECASE):
+            return (
+                f"El ultimo mensaje menciona tu propio nombre como objetivo gramatical. "
+                f"Recuerda que {villager_name} eres tu; no lo trates como otro NPC con el mismo nombre."
+            )
+    return ""
 
 
 CONSTRUCTION_MEMORY_TERMS = (
@@ -1760,10 +1861,13 @@ def build_instructions(
     family_context: str,
     village_context: str,
     self_context: str,
+    name_reference_context: str,
 ) -> str:
     parts = [read_prompt()]
     if self_context:
         parts.append(self_context)
+    if name_reference_context:
+        parts.append(name_reference_context)
     parts.append(player_rule)
     if player_lore:
         parts.append(player_lore)
@@ -2215,9 +2319,13 @@ class Handler(BaseHTTPRequestHandler):
         system_villager_name, system_player_name = extract_names_from_system(system_text)
         villager_name = villager_name or system_villager_name
         player_name = player_name or system_player_name
+        original_last_user = last_user
+        input_messages, last_user, had_self_vocative = rewrite_vocative_messages(input_messages, villager_name)
         ids = parse_session_ids(system_text)
         ids = apply_fallback_session_ids(ids, villager_name, player_name, system_text)
-        debug_snapshot = request_debug_snapshot(ids, villager_name, player_name, system_text, last_user)
+        debug_snapshot = request_debug_snapshot(ids, villager_name, player_name, system_text, original_last_user)
+        debug_snapshot["model_last_user_excerpt"] = compact_text(last_user, 120)
+        debug_snapshot["self_vocative_rewrite"] = had_self_vocative
         self.server.recent_debug.appendleft(debug_snapshot)
         print(
             "[MCA request] "
@@ -2320,6 +2428,9 @@ class Handler(BaseHTTPRequestHandler):
             family_context=family_context,
             village_context=village_context,
             self_context=self_awareness_context(system_text, registered_villager_name, registered_player_name, ids),
+            name_reference_context=self_name_reference_guidance(
+                original_last_user, last_user, registered_villager_name
+            ),
         )
         text, error = call_openai_responses(
             api_key=api_key,
