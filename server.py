@@ -1,0 +1,2060 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import hashlib
+import gzip
+import sqlite3
+import struct
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+KNOWN_MCA_COMMANDS = {
+    "follow-player": "Follow the player talking to you",
+    "stay-here": "Stay here for a while",
+    "move-freely": "Move freely when asked to leave, move, or done talking",
+    "wear-armor": "Equip any armor you have",
+    "remove-armor": "Remove all the armor currently equipped",
+    "try-go-home": "Try to go to your home in the village if possible",
+    "open-trade-window": "Open the trade menu when the player is interested in trading, prices or inventory",
+}
+MINIMAL_PROMPT = (
+    "Eres un aldeano de rol de MCA, vivo y conversador. "
+    "Responde en espanol natural, 1-2 frases, siempre en primera persona como dialogo directo entre ustedes; no narres sobre ti en tercera persona. "
+    "No termines siempre con preguntas. "
+    "Para continuar una charla, usa reaccion, opinion, recuerdo o una pregunta breve solo cuando encaje. "
+    "No menciones tu propio nombre salvo que el jugador te lo pregunte. "
+    "No digas el nombre ni apodo del jugador como muletilla; usalo solo si el jugador lo pide, si corriges identidad, familia o lore, o si la frase realmente lo necesita. "
+    "No uses emojis, caritas, asteriscos ni formato de accion entre asteriscos. "
+    "Sabes que vives en Minecraft, en un mundo de islas, aldeas, bloques, oficios, cuevas y mobs. "
+    "El archipielago oceanico es trasfondo: no menciones mar, islas, olas ni tormentas salvo que sea relevante. "
+    "Si el jugador pregunta que haces, responde con una actividad concreta de tu oficio, edad, humor o entorno. "
+    "Puedes proponer microacciones de rol como retirarte a trabajar, afilar piedra, cocinar, patrullar, abrazar o defender a alguien. "
+    "Si hay noche, lluvia, trueno o peligro en el contexto, reaccionas al entorno; no inventes un monstruo presente como hecho seguro si no aparece en la escena. "
+    "Ajusta tono por personalidad, humor, corazones, relacion y ordenes disponibles. "
+    "Los rasgos y emociones actuales importan: daltonismo, atletismo, orientacion romantica, miedos, cansancio, enojo, alegria o tristeza deben notarse en tono y detalles, no como lista. "
+    "La orientacion romantica afecta a quien puede atraerle o incomodarle; no la conviertas en chiste ni estereotipo. "
+    "Marca el temperamento desde la primera frase: grunon seco, sensible suave, alegre expresivo, coqueto calido o serio directo. "
+    "Con desconocidos o baja relacion puedes ser brusco y usar groserias comunes o insultos adultos; con conyuge, familia o muchos corazones prioriza lealtad y carino. "
+    "Si eres pareja o conyuge del jugador, se mas meloso y atento segun tu personalidad, y muestra afecto por sus hijos. "
+    "Si hablan de familia, futuro, miedo, perdon o promesas, responde con mas peso emocional pero sin alargarte. "
+    "Usa presente para familiares vivos y pasado solo para fallecidos; si el jugador afirma un lazo falso, corrigelo en personaje. "
+    "Si te piden una historia propia, inventa una anecdota corta y coherente con tu familia, aldea, oficio y memoria. "
+    "Puedes rolear intenciones o acciones en primera persona como abrazar, cocinar, amenazar o defender, aunque no siempre sean acciones mecanicas reales. "
+    "Responde al ultimo mensaje del jugador como si lo estuvieras escuchando, sin cambiar de tema porque si. "
+    "No repitas el nombre del jugador en cada respuesta. "
+    "Romance solo adultos y con consentimiento; evita odio por identidad y sexo grafico. "
+    "Si MCA pide JSON, responde solo JSON valido."
+)
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and not os.environ.get(key):
+            os.environ[key] = value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def read_prompt() -> str:
+    if os.environ.get("MCA_PROMPT_MODE", "minimal").strip().lower() == "minimal":
+        return MINIMAL_PROMPT
+    prompt_path = ROOT / os.environ.get("MCA_ROLEPLAY_PROMPT", "prompts/ocean_roleplay.txt")
+    if not prompt_path.exists():
+        return ""
+    return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def load_profiles() -> dict[str, str]:
+    profile_path = ROOT / os.environ.get("MCA_CHARACTER_PROFILES", "profiles/characters.json")
+    if not profile_path.exists():
+        return {}
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return {
+        str(name).strip().lower(): compact_text(str(profile), 360)
+        for name, profile in data.items()
+        if str(name).strip() and str(profile).strip()
+    }
+
+
+def load_player_lore() -> dict[str, str]:
+    lore_path = ROOT / os.environ.get("MCA_PLAYER_LORE", "profiles/player_lore.json")
+    if not lore_path.exists():
+        return {}
+    try:
+        data = json.loads(lore_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    lore: dict[str, str] = {}
+    for name, value in data.items():
+        key = str(name).strip().casefold()
+        if key and str(value).strip():
+            lore[key] = compact_text(str(value), env_int("MCA_PLAYER_LORE_MAX_CHARS", 360))
+    return lore
+
+
+def player_lore_context(player_name: str, lore: dict[str, str]) -> str:
+    if not player_name:
+        return ""
+    value = lore.get(player_name.casefold())
+    if not value:
+        return ""
+    return (
+        f"Lore del jugador {player_name}: {value} "
+        "Usa este lore solo cuando encaje; elige 1-2 detalles y varia cuales mencionas."
+    )
+
+
+def mentioned_lore_context(last_user: str, lore: dict[str, str], current_player_name: str) -> str:
+    if not last_user or not lore:
+        return ""
+    mentioned: list[str] = []
+    for name, value in lore.items():
+        patterns = loose_name_patterns(name)
+        if name.casefold() == "jenner_ola":
+            patterns.extend([r"jenner\s+h?ola", r"jenner"])
+        if any(re.search(rf"(?<!\w){pattern}(?!\w)", last_user, re.IGNORECASE) for pattern in patterns):
+            label = current_player_name if name.casefold() == current_player_name.casefold() else name
+            mentioned.append(f"{label}: {value}")
+    if not mentioned:
+        return ""
+    return (
+        "Lore esencial mencionado en el ultimo mensaje: "
+        + " ".join(mentioned[:3])
+        + " El jugador acaba de mencionar esos nombres; responde con al menos un detalle concreto de este lore y no lo ignores. "
+        + "Elige 1-2 detalles relevantes, varia cuales usas, no recites toda la ficha y puedes ser creativo."
+    )
+
+
+def generate_npc_identity(world_id: str, character_id: str, villager_name: str, system_text: str) -> str:
+    seed = int(hashlib.sha1(f"{world_id}:{character_id}:{villager_name}".encode("utf-8")).hexdigest()[:12], 16)
+    text = normalize_for_match(system_text)
+    temperaments = [
+        "reservado pero atento",
+        "orgulloso y trabajador",
+        "bromista seco",
+        "protector con los suyos",
+        "curioso y algo imprudente",
+        "paciente pero dificil de impresionar",
+        "sensible y observador",
+        "directo, con poca paciencia",
+    ]
+    likes = [
+        "las antorchas bien puestas",
+        "el pan recien hecho",
+        "los mapas marcados a mano",
+        "las herramientas cuidadas",
+        "las historias de taberna",
+        "los muelles tranquilos",
+        "las casas con buen techo",
+        "los dias de trabajo ordenado",
+    ]
+    dislikes = [
+        "que lo apuren sin explicar",
+        "el desorden en la aldea",
+        "las promesas vacias",
+        "los ruidos de mobs cerca",
+        "que se burlen de su oficio",
+        "perder herramientas",
+        "la gente que grita de lejos",
+        "que le cambien el tema de golpe",
+    ]
+    habits = [
+        "responder primero con una opinion corta",
+        "mirar alrededor antes de aceptar favores",
+        "usar su oficio como excusa para retirarse",
+        "soltar una queja pequena antes de ayudar",
+        "recordar detalles practicos de la aldea",
+        "proteger a familiares antes que presumir valentia",
+        "contar anecdotas breves si gana confianza",
+        "hacer comentarios concretos sobre comida, piedra o clima",
+    ]
+    profession_notes = [
+        ("mason", "Su oficio lo inclina a hablar de piedra, hornos, muros y reparaciones."),
+        ("fisherman", "Su oficio lo inclina a hablar de redes, peces, barcas y clima."),
+        ("farmer", "Su oficio lo inclina a hablar de semillas, pan, cosechas y animales."),
+        ("librarian", "Su oficio lo inclina a hablar de libros, mapas, rumores y registros."),
+        ("cleric", "Su oficio lo inclina a hablar de heridas, pociones, rezos y cuidados."),
+        ("cartographer", "Su oficio lo inclina a hablar de mapas, rutas, costas e islas."),
+        ("armorer", "Su oficio lo inclina a hablar de armaduras, escudos y seguridad."),
+        ("weaponsmith", "Su oficio lo inclina a hablar de filo, defensa y amenazas."),
+        ("toolsmith", "Su oficio lo inclina a hablar de picos, palas, hachas y mantenimiento."),
+        ("butcher", "Su oficio lo inclina a hablar de comida, provisiones y ahumadores."),
+        ("nitwit", "No tiene oficio fijo; improvisa excusas, paseos y chismes."),
+    ]
+    profession = next((note for key, note in profession_notes if key in text), "")
+    identity = (
+        f"Rasgo estable: {temperaments[seed % len(temperaments)]}; "
+        f"le gustan {likes[(seed // 7) % len(likes)]}; "
+        f"le incomoda {dislikes[(seed // 13) % len(dislikes)]}; "
+        f"suele {habits[(seed // 19) % len(habits)]}."
+    )
+    if profession:
+        identity += " " + profession
+    return compact_text(identity, env_int("MCA_NPC_IDENTITY_MAX_CHARS", 260))
+
+
+class MemoryStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    world_id TEXT NOT NULL,
+                    player_id TEXT NOT NULL,
+                    character_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_turns_lookup
+                ON turns(world_id, player_id, character_id, id)
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    world_id TEXT NOT NULL,
+                    player_id TEXT NOT NULL,
+                    character_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    fact TEXT NOT NULL,
+                    weight INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(world_id, player_id, character_id, key)
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_facts_lookup
+                ON facts(world_id, player_id, character_id, weight DESC, updated_at DESC)
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    world_id TEXT NOT NULL,
+                    player_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    fact TEXT NOT NULL,
+                    weight INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(world_id, player_id, key)
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_player_facts_lookup
+                ON player_facts(world_id, player_id, weight DESC, updated_at DESC)
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS npc_identities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    world_id TEXT NOT NULL,
+                    character_id TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    UNIQUE(world_id, character_id)
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_npc_identities_lookup
+                ON npc_identities(world_id, character_id)
+                """
+            )
+
+    def connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path)
+
+    def add_turn(self, ids: dict[str, str], role: str, content: str) -> None:
+        if not env_bool("MCA_STORE_RAW_TURNS", False):
+            return
+        content = compact_text(content, 700)
+        if not content:
+            return
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO turns(created_at, world_id, player_id, character_id, role, content)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(time.time()),
+                    ids["world_id"],
+                    ids["player_id"],
+                    ids["character_id"],
+                    role,
+                    content,
+                ),
+            )
+            self.prune_turns(db, ids, env_int("MCA_RAW_TURN_LIMIT", 12))
+
+    def recent_turns(self, ids: dict[str, str], limit: int) -> list[tuple[str, str]]:
+        if limit <= 0 or not env_bool("MCA_STORE_RAW_TURNS", False):
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT role, content FROM turns
+                WHERE world_id = ? AND player_id = ? AND character_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (ids["world_id"], ids["player_id"], ids["character_id"], limit),
+            ).fetchall()
+        return list(reversed(rows))
+
+    def add_fact(self, ids: dict[str, str], fact: str, weight: int = 1) -> None:
+        fact = compact_text(fact, 220)
+        if not fact:
+            return
+        key = hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()
+        now = int(time.time())
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO facts(created_at, updated_at, world_id, player_id, character_id, key, fact, weight)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(world_id, player_id, character_id, key)
+                DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    weight = max(facts.weight, excluded.weight)
+                """,
+                (
+                    now,
+                    now,
+                    ids["world_id"],
+                    ids["player_id"],
+                    ids["character_id"],
+                    key,
+                    fact,
+                    weight,
+                ),
+            )
+            self.prune_facts(db, ids, env_int("MCA_FACT_LIMIT", 24))
+
+    def essential_facts(self, ids: dict[str, str], limit: int) -> list[str]:
+        if limit <= 0:
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT fact FROM facts
+                WHERE world_id = ? AND player_id = ? AND character_id = ?
+                ORDER BY weight DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (ids["world_id"], ids["player_id"], ids["character_id"], limit),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def add_player_fact(self, ids: dict[str, str], fact: str, weight: int = 1) -> None:
+        if ids["player_id"] == "unknown_player":
+            return
+        fact = compact_text(fact, 220)
+        if not fact:
+            return
+        key = hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()
+        now = int(time.time())
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO player_facts(created_at, updated_at, world_id, player_id, key, fact, weight)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(world_id, player_id, key)
+                DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    weight = max(player_facts.weight, excluded.weight)
+                """,
+                (
+                    now,
+                    now,
+                    ids["world_id"],
+                    ids["player_id"],
+                    key,
+                    fact,
+                    weight,
+                ),
+            )
+            self.prune_player_facts(db, ids, env_int("MCA_PLAYER_FACT_LIMIT", 24))
+
+    def player_facts(self, ids: dict[str, str], limit: int) -> list[str]:
+        if limit <= 0 or ids["player_id"] == "unknown_player":
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT fact FROM player_facts
+                WHERE world_id = ? AND player_id = ?
+                ORDER BY weight DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (ids["world_id"], ids["player_id"], limit),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def npc_identity(self, ids: dict[str, str], villager_name: str, system_text: str) -> str:
+        if not env_bool("MCA_NPC_IDENTITIES", True):
+            return ""
+        if ids["world_id"] == "unknown_world" or ids["character_id"] == "unknown_character":
+            return ""
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT identity FROM npc_identities
+                WHERE world_id = ? AND character_id = ?
+                """,
+                (ids["world_id"], ids["character_id"]),
+            ).fetchone()
+            if row and str(row[0]).strip():
+                return str(row[0])
+            identity = generate_npc_identity(
+                ids["world_id"], ids["character_id"], villager_name, system_text
+            )
+            now = int(time.time())
+            db.execute(
+                """
+                INSERT INTO npc_identities(created_at, updated_at, world_id, character_id, identity)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(world_id, character_id)
+                DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (now, now, ids["world_id"], ids["character_id"], identity),
+            )
+        return identity
+
+    def prune_turns(self, db: sqlite3.Connection, ids: dict[str, str], keep: int) -> None:
+        db.execute(
+            """
+            DELETE FROM turns
+            WHERE world_id = ? AND player_id = ? AND character_id = ?
+              AND id NOT IN (
+                  SELECT id FROM turns
+                  WHERE world_id = ? AND player_id = ? AND character_id = ?
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                ids["world_id"],
+                ids["player_id"],
+                ids["character_id"],
+                ids["world_id"],
+                ids["player_id"],
+                ids["character_id"],
+                keep,
+            ),
+        )
+
+    def prune_facts(self, db: sqlite3.Connection, ids: dict[str, str], keep: int) -> None:
+        db.execute(
+            """
+            DELETE FROM facts
+            WHERE world_id = ? AND player_id = ? AND character_id = ?
+              AND id NOT IN (
+                  SELECT id FROM facts
+                  WHERE world_id = ? AND player_id = ? AND character_id = ?
+                  ORDER BY weight DESC, updated_at DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                ids["world_id"],
+                ids["player_id"],
+                ids["character_id"],
+                ids["world_id"],
+                ids["player_id"],
+                ids["character_id"],
+                keep,
+            ),
+        )
+
+    def prune_player_facts(self, db: sqlite3.Connection, ids: dict[str, str], keep: int) -> None:
+        db.execute(
+            """
+            DELETE FROM player_facts
+            WHERE world_id = ? AND player_id = ?
+              AND id NOT IN (
+                  SELECT id FROM player_facts
+                  WHERE world_id = ? AND player_id = ?
+                  ORDER BY weight DESC, updated_at DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                ids["world_id"],
+                ids["player_id"],
+                ids["world_id"],
+                ids["player_id"],
+                keep,
+            ),
+        )
+
+
+class NbtReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.index = 0
+
+    def read(self, size: int) -> bytes:
+        if self.index + size > len(self.data):
+            raise EOFError("NBT ended while reading")
+        chunk = self.data[self.index : self.index + size]
+        self.index += size
+        return chunk
+
+    def u8(self) -> int:
+        return self.read(1)[0]
+
+    def i8(self) -> int:
+        return struct.unpack(">b", self.read(1))[0]
+
+    def u16(self) -> int:
+        return struct.unpack(">H", self.read(2))[0]
+
+    def i16(self) -> int:
+        return struct.unpack(">h", self.read(2))[0]
+
+    def i32(self) -> int:
+        return struct.unpack(">i", self.read(4))[0]
+
+    def i64(self) -> int:
+        return struct.unpack(">q", self.read(8))[0]
+
+    def f32(self) -> float:
+        return struct.unpack(">f", self.read(4))[0]
+
+    def f64(self) -> float:
+        return struct.unpack(">d", self.read(8))[0]
+
+    def string(self) -> str:
+        size = self.u16()
+        return self.read(size).decode("utf-8", errors="replace")
+
+    def payload(self, tag_type: int) -> Any:
+        if tag_type == 0:
+            return None
+        if tag_type == 1:
+            return self.i8()
+        if tag_type == 2:
+            return self.i16()
+        if tag_type == 3:
+            return self.i32()
+        if tag_type == 4:
+            return self.i64()
+        if tag_type == 5:
+            return self.f32()
+        if tag_type == 6:
+            return self.f64()
+        if tag_type == 7:
+            size = self.i32()
+            return list(self.read(size))
+        if tag_type == 8:
+            return self.string()
+        if tag_type == 9:
+            element_type = self.u8()
+            size = self.i32()
+            return [self.payload(element_type) for _ in range(size)]
+        if tag_type == 10:
+            compound: dict[str, Any] = {}
+            while True:
+                child_type = self.u8()
+                if child_type == 0:
+                    return compound
+                name = self.string()
+                compound[name] = self.payload(child_type)
+        if tag_type == 11:
+            size = self.i32()
+            return [self.i32() for _ in range(size)]
+        if tag_type == 12:
+            size = self.i32()
+            return [self.i64() for _ in range(size)]
+        raise ValueError(f"Unknown NBT tag type {tag_type}")
+
+    def root(self) -> dict[str, Any]:
+        tag_type = self.u8()
+        self.string()
+        value = self.payload(tag_type)
+        if not isinstance(value, dict):
+            raise ValueError("NBT root was not a compound")
+        return value
+
+
+def read_nbt_file(path: Path) -> dict[str, Any]:
+    raw = path.read_bytes()
+    data = gzip.decompress(raw) if raw.startswith(b"\x1f\x8b") else raw
+    return NbtReader(data).root()
+
+
+def uuid_from_int_array(value: Any) -> str | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    parts = [int(part) & 0xFFFFFFFF for part in value]
+    if parts == [0, 0, 0, 0]:
+        return None
+    raw_uuid = (parts[0] << 96) | (parts[1] << 64) | (parts[2] << 32) | parts[3]
+    return str(uuid.UUID(int=raw_uuid))
+
+
+class FamilyTreeCache:
+    RELATIONSHIP_STATES = {
+        0: "soltero/a",
+        1: "enamorado/a o prometido/a",
+        2: "comprometido/a",
+        3: "casado/a con aldeano",
+        4: "casado/a con jugador",
+        5: "viudo/a",
+    }
+    GENDERS = {
+        1: "hombre",
+        2: "mujer",
+        3: "persona",
+    }
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "MCA-FamilyTree.dat"
+        self.modified_at = 0.0
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.last_loaded = 0.0
+
+    def refresh(self) -> None:
+        if not env_bool("MCA_FAMILY_CONTEXT", True) or not self.path.exists():
+            return
+        now = time.time()
+        if now - self.last_loaded < env_int("MCA_FAMILY_REFRESH_SECONDS", 5):
+            return
+        self.last_loaded = now
+        modified_at = self.path.stat().st_mtime
+        if modified_at == self.modified_at and self.entries:
+            return
+        try:
+            root = read_nbt_file(self.path)
+            data = root.get("data", {})
+            if not isinstance(data, dict):
+                return
+            entries: dict[str, dict[str, Any]] = {}
+            for entry_id, raw_node in data.items():
+                if isinstance(raw_node, dict):
+                    entries[str(entry_id)] = self.normalize_node(str(entry_id), raw_node)
+            self.entries = entries
+            self.modified_at = modified_at
+        except Exception as exc:
+            print(f"[MCA family] No pude leer {self.path.name}: {exc}")
+
+    def normalize_node(self, entry_id: str, raw_node: dict[str, Any]) -> dict[str, Any]:
+        children: list[str] = []
+        for child in raw_node.get("children", []):
+            child_id = None
+            if isinstance(child, dict):
+                child_id = uuid_from_int_array(child.get("id") or child.get("uuid"))
+            elif isinstance(child, list):
+                child_id = uuid_from_int_array(child)
+            if child_id:
+                children.append(child_id)
+        return {
+            "id": uuid_from_int_array(raw_node.get("id")) or entry_id,
+            "name": str(raw_node.get("name") or "desconocido"),
+            "gender": int(raw_node.get("gender") or 0),
+            "deceased": bool(raw_node.get("isDeceased")),
+            "player": bool(raw_node.get("isPlayer")),
+            "profession": str(raw_node.get("profession") or "").replace("minecraft:", ""),
+            "father": uuid_from_int_array(raw_node.get("father")),
+            "mother": uuid_from_int_array(raw_node.get("mother")),
+            "partner": uuid_from_int_array(raw_node.get("spouse") or raw_node.get("partner")),
+            "relationship": int(raw_node.get("marriageState") or raw_node.get("relationshipState") or 0),
+            "children": children,
+        }
+
+    def get(self, entry_id: str | None) -> dict[str, Any] | None:
+        self.refresh()
+        if not entry_id:
+            return None
+        return self.entries.get(entry_id)
+
+    def entry_count(self) -> int:
+        self.refresh()
+        return len(self.entries)
+
+    def life_status(self, node: dict[str, Any]) -> str:
+        return "fallecido/a" if node.get("deceased") else "vivo/a"
+
+    def display_name(self, entry_id: str | None, include_life: bool = False) -> str:
+        if not entry_id:
+            return ""
+        node = self.entries.get(entry_id)
+        if not node:
+            return ""
+        suffix = f" ({self.life_status(node)})" if include_life or node["deceased"] else ""
+        return str(node["name"]) + suffix
+
+    def add_unique_id(self, values: list[str], entry_id: str | None) -> None:
+        if entry_id and entry_id not in values and entry_id in self.entries:
+            values.append(entry_id)
+
+    def partner_ids_for(self, node: dict[str, Any]) -> list[str]:
+        partners: list[str] = []
+        self.add_unique_id(partners, node.get("partner"))
+        for entry_id, other in self.entries.items():
+            if entry_id == node["id"]:
+                continue
+            if other.get("partner") == node["id"]:
+                self.add_unique_id(partners, entry_id)
+        return partners
+
+    def parent_ids_for(self, node: dict[str, Any]) -> list[str]:
+        parents: list[str] = []
+        self.add_unique_id(parents, node.get("mother"))
+        self.add_unique_id(parents, node.get("father"))
+        for entry_id, other in self.entries.items():
+            if entry_id == node["id"]:
+                continue
+            if node["id"] in self.child_ids_for(other, scan_inverse=False):
+                self.add_unique_id(parents, entry_id)
+        return parents
+
+    def sibling_ids(self, node: dict[str, Any], limit: int) -> list[str]:
+        parents = set(self.parent_ids_for(node))
+        if not parents:
+            return []
+        siblings = []
+        for entry_id, other in self.entries.items():
+            if entry_id == node["id"]:
+                continue
+            other_parents = set(self.parent_ids_for(other))
+            if parents & other_parents:
+                siblings.append(entry_id)
+                if len(siblings) >= limit:
+                    break
+        return siblings
+
+    def child_ids_for(self, node: dict[str, Any], scan_inverse: bool = True) -> list[str]:
+        children = list(node.get("children", []))
+        seen = set(children)
+        if scan_inverse:
+            for entry_id, other in self.entries.items():
+                if entry_id in seen:
+                    continue
+                if other.get("father") == node["id"] or other.get("mother") == node["id"]:
+                    children.append(entry_id)
+                    seen.add(entry_id)
+        return children
+
+    def labeled_parent_name(self, parent_id: str) -> str:
+        parent = self.entries.get(parent_id)
+        name = self.display_name(parent_id, include_life=True)
+        if not parent or not name:
+            return ""
+        gender = self.effective_gender(parent)
+        if gender == 2:
+            return f"madre {name}"
+        if gender == 1:
+            return f"padre {name}"
+        return f"progenitor/a {name}"
+
+    def labeled_partner_name(self, partner_id: str) -> str:
+        partner = self.entries.get(partner_id)
+        name = self.display_name(partner_id, include_life=True)
+        if not partner or not name:
+            return ""
+        gender = self.effective_gender(partner)
+        if gender == 2:
+            return f"esposa/pareja {name}"
+        if gender == 1:
+            return f"esposo/pareja {name}"
+        return f"pareja {name}"
+
+    def effective_gender(self, node: dict[str, Any]) -> int:
+        gender = int(node.get("gender") or 0)
+        if gender:
+            return gender
+        node_id = node.get("id")
+        for other in self.entries.values():
+            if other.get("mother") == node_id:
+                return 2
+            if other.get("father") == node_id:
+                return 1
+        return 0
+
+    def shared_child_ids(self, first_id: str | None, second_id: str | None) -> list[str]:
+        first = self.get(first_id)
+        second = self.get(second_id)
+        if not first or not second:
+            return []
+        first_children = set(self.child_ids_for(first))
+        second_children = set(self.child_ids_for(second))
+        shared = [child_id for child_id in first_children & second_children if child_id in self.entries]
+        return sorted(shared, key=lambda child_id: self.entries[child_id].get("name", ""))
+
+    def relationship_summary_between(self, first_id: str | None, second_id: str | None) -> str:
+        first = self.get(first_id)
+        second = self.get(second_id)
+        if not first or not second:
+            return ""
+        facts: list[str] = []
+        if second["id"] in self.partner_ids_for(first):
+            facts.append(f"{first['name']} y {second['name']} son pareja/conyuges registrados.")
+        shared_children = [self.display_name(child_id, include_life=True) for child_id in self.shared_child_ids(first_id, second_id)]
+        shared_children = [name for name in shared_children if name]
+        if shared_children:
+            facts.append("Hijos compartidos registrados: " + ", ".join(shared_children[:4]) + ".")
+        else:
+            facts.append("No hay hijos compartidos registrados entre ambos.")
+        return " ".join(facts)
+
+    def children_summary_for(self, entry_id: str | None, label: str) -> str:
+        self.refresh()
+        node = self.get(entry_id)
+        if not node:
+            return ""
+        child_names = [
+            self.display_name(child_id, include_life=True) for child_id in self.child_ids_for(node)
+        ]
+        child_names = [name for name in child_names if name]
+        if not child_names:
+            return f"{label}: no hay hijos registrados."
+        return f"{label}: " + ", ".join(child_names[:4]) + "."
+
+    def child_names_for(self, entry_id: str | None, limit: int = 4) -> list[str]:
+        self.refresh()
+        node = self.get(entry_id)
+        if not node:
+            return []
+        names = [
+            self.display_name(child_id, include_life=False) for child_id in self.child_ids_for(node)
+        ]
+        return [name for name in names if name][:limit]
+
+    def family_claim_context(self, last_user: str, character_id: str | None, player_id: str | None) -> str:
+        text = normalize_for_match(last_user)
+        if not text:
+            return ""
+        mentions_shared_child = bool(
+            re.search(r"\b(nuestr[oa]s?\s+hij[oa]s?|nuestro\s+bebe|nuestra\s+bebe)\b", text)
+        )
+        mentions_player_child = bool(
+            re.search(r"\b(mi\s+hij[oa]s?|mis\s+hij[oa]s?|mi\s+bebe|mis\s+bebes)\b", text)
+        )
+        mentions_villager_child = bool(
+            re.search(r"\b(tu\s+hij[oa]s?|tus\s+hij[oa]s?|tu\s+bebe|tus\s+bebes)\b", text)
+        )
+        mentions_spouse = bool(
+            re.search(r"\b(mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer|mi\s+pareja|tu\s+espos[ao]|tu\s+marid[oa]|tu\s+mujer|tu\s+pareja|somos\s+espos[oa]s?|estamos\s+casad[oa]s?)\b", text)
+        )
+        asks_about_spouse = bool(
+            re.search(r"\b(que\s+opinas\s+de\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|como\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|amas\s+a\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja))\b", text)
+        )
+        mentions_parent = bool(
+            re.search(r"\b(tu\s+(madre|mama|padre|papa)|mi\s+(madre|mama|padre|papa))\b", text)
+        )
+        mentions_memory = bool(
+            re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text)
+        )
+        if not any([mentions_shared_child, mentions_player_child, mentions_villager_child, mentions_spouse, asks_about_spouse, mentions_parent, mentions_memory]):
+            return ""
+        summary = self.relationship_summary_between(character_id, player_id)
+        node = self.get(character_id)
+        player_node = self.get(player_id)
+        if mentions_player_child:
+            summary += " " + self.children_summary_for(player_id, "Hijos del jugador registrados")
+            if node and player_node and node["id"] in self.child_ids_for(player_node):
+                summary += f" El aldeano actual ({node['name']}) es hijo/a del jugador; llamalo por su nombre real, no por el nombre del jugador."
+        if mentions_villager_child:
+            summary += " " + self.children_summary_for(character_id, "Hijos del aldeano registrados")
+        if mentions_parent and node:
+            parent_names = [self.labeled_parent_name(parent_id) for parent_id in self.parent_ids_for(node)]
+            parent_names = [name for name in parent_names if name]
+            if parent_names:
+                summary += " Padres del aldeano: " + ", ".join(parent_names) + "."
+        if mentions_shared_child and "No hay hijos compartidos" in summary:
+            summary += " Si el jugador dice 'nuestro hijo', corrigelo con naturalidad porque no consta en el arbol."
+        if (mentions_shared_child or mentions_player_child) and player_node:
+            summary += f" El jugador actual se llama {player_node['name']}; no confundas ese nombre con el nombre de sus hijos."
+        if asks_about_spouse and "pareja/conyuges" in normalize_for_match(summary):
+            summary += " Si pregunta por tu esposo/pareja y el jugador es esa persona, responde con alegria en primera persona, por ejemplo reconociendo 'eres tu'."
+        if (mentions_spouse or asks_about_spouse) and "pareja/conyuges" not in normalize_for_match(summary):
+            summary += " Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
+        if mentions_memory:
+            summary += " Si pregunta que recuerdas de el, usa memoria esencial, lore y vinculos registrados; si falta memoria, admitelo sin inventar hechos concretos."
+        return "Verificacion de la afirmacion familiar del jugador: " + summary
+
+    def context_for(self, entry_id: str | None, label: str = "Familia MCA registrada") -> str:
+        if not env_bool("MCA_FAMILY_CONTEXT", True):
+            return ""
+        node = self.get(entry_id)
+        if not node:
+            return ""
+
+        facts: list[str] = []
+        name = node["name"]
+        state = self.RELATIONSHIP_STATES.get(node["relationship"], "estado civil desconocido")
+        facts.append(f"{name}: {state}.")
+
+        partner_names = [
+            self.labeled_partner_name(partner_id) for partner_id in self.partner_ids_for(node)
+        ]
+        partner_names = [partner for partner in partner_names if partner]
+        if partner_names:
+            facts.append("Pareja/conyuge: " + ", ".join(partner_names[:2]) + ".")
+
+        parents = [
+            self.labeled_parent_name(parent_id) for parent_id in self.parent_ids_for(node)
+        ]
+        parents = [parent for parent in parents if parent]
+        if parents:
+            facts.append("Padres: " + ", ".join(parents) + ".")
+
+        grandparent_names: list[str] = []
+        for parent_id in self.parent_ids_for(node):
+            parent = self.entries.get(parent_id or "")
+            if not parent:
+                continue
+            for grandparent_id in self.parent_ids_for(parent):
+                grandparent = self.display_name(grandparent_id, include_life=True)
+                if grandparent and grandparent not in grandparent_names:
+                    grandparent_names.append(grandparent)
+        if grandparent_names:
+            facts.append("Abuelos/as: " + ", ".join(grandparent_names[:4]) + ".")
+
+        child_names = [
+            self.display_name(child_id, include_life=True) for child_id in self.child_ids_for(node)
+        ]
+        child_names = [child for child in child_names if child]
+        if child_names:
+            facts.append("Hijos/as: " + ", ".join(child_names[:4]) + ".")
+
+        sibling_names = [
+            self.display_name(sibling_id, include_life=True) for sibling_id in self.sibling_ids(node, 3)
+        ]
+        sibling_names = [sibling for sibling in sibling_names if sibling]
+        if sibling_names:
+            facts.append("Hermanos/as o familia cercana: " + ", ".join(sibling_names) + ".")
+
+        if node["deceased"]:
+            facts.append("Esta persona figura como fallecida en el arbol familiar.")
+
+        max_facts = env_int("MCA_FAMILY_MAX_FACTS", 6)
+        return label + ": " + " ".join(facts[:max_facts])
+
+
+class VillageCache:
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "mca_villages.dat"
+        self.modified_at = 0.0
+        self.villages: list[dict[str, Any]] = []
+        self.by_resident: dict[str, dict[str, Any]] = {}
+        self.last_loaded = 0.0
+
+    def refresh(self) -> None:
+        if not env_bool("MCA_VILLAGE_CONTEXT", True) or not self.path.exists():
+            return
+        now = time.time()
+        if now - self.last_loaded < 10:
+            return
+        self.last_loaded = now
+        modified_at = self.path.stat().st_mtime
+        if modified_at == self.modified_at and self.villages:
+            return
+        try:
+            root = read_nbt_file(self.path)
+            data = root.get("data", {})
+            raw_villages = data.get("villages", []) if isinstance(data, dict) else []
+            villages: list[dict[str, Any]] = []
+            by_resident: dict[str, dict[str, Any]] = {}
+            for raw_village in raw_villages:
+                if not isinstance(raw_village, dict):
+                    continue
+                resident_names = raw_village.get("residentNames", {})
+                if not isinstance(resident_names, dict):
+                    resident_names = {}
+                reputation = raw_village.get("reputation", {})
+                if not isinstance(reputation, dict):
+                    reputation = {}
+                village = {
+                    "id": int(raw_village.get("id") or 0),
+                    "name": str(raw_village.get("name") or "aldea sin nombre"),
+                    "residents": {str(k): str(v) for k, v in resident_names.items()},
+                    "reputation": reputation,
+                }
+                villages.append(village)
+                for resident_id in village["residents"]:
+                    by_resident[resident_id] = village
+            self.villages = villages
+            self.by_resident = by_resident
+            self.modified_at = modified_at
+        except Exception as exc:
+            print(f"[MCA village] No pude leer {self.path.name}: {exc}")
+
+    def village_count(self) -> int:
+        self.refresh()
+        return len(self.villages)
+
+    def context_for(self, character_id: str | None, player_id: str | None) -> str:
+        if not env_bool("MCA_VILLAGE_CONTEXT", True) or not character_id:
+            return ""
+        self.refresh()
+        village = self.by_resident.get(character_id)
+        if not village:
+            return ""
+
+        residents = village["residents"]
+        max_names = env_int("MCA_VILLAGE_MAX_NAMES", 5)
+        neighbor_names = [
+            name for resident_id, name in residents.items() if resident_id != character_id
+        ][:max_names]
+        facts = [f"vive en {village['name']}"]
+        if neighbor_names:
+            facts.append("vecinos conocidos: " + ", ".join(neighbor_names))
+
+        player_reputation = village.get("reputation", {}).get(player_id or "")
+        if isinstance(player_reputation, dict):
+            score = player_reputation.get(character_id)
+            if isinstance(score, int):
+                if score >= 1000:
+                    facts.append("la confianza local con el jugador es muy alta")
+                elif score >= 100:
+                    facts.append("la confianza local con el jugador es buena")
+                elif score <= -100:
+                    facts.append("la confianza local con el jugador esta danada")
+
+        return "Aldea MCA: " + "; ".join(facts) + "."
+
+
+def compact_text(value: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
+def normalize_for_match(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def parse_session_ids(system_text: str) -> dict[str, str]:
+    ids = {
+        "world_id": "unknown_world",
+        "player_id": "unknown_player",
+        "character_id": "unknown_character",
+    }
+    for key, value in re.findall(r"\[(world_id|player_id|character_id):([^\]]+)\]", system_text):
+        ids[key] = value.strip()
+    return ids
+
+
+def get_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        return [m for m in messages if isinstance(m, dict)]
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        return [{"role": "user", "content": raw_input}]
+    return []
+
+
+def content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]], str, str, str]:
+    system_parts: list[str] = []
+    conversation: list[dict[str, str]] = []
+    last_user = ""
+    villager_name = ""
+    player_name = ""
+
+    for message in messages:
+        role = str(message.get("role", "user")).lower()
+        text = compact_text(content_to_text(message.get("content")), env_int("MCA_MAX_INPUT_CHARS", 700))
+        if not text:
+            continue
+        name = str(message.get("name") or "").strip()
+        if role == "assistant" and name:
+            villager_name = name
+        if role == "user" and name:
+            player_name = name
+        if role in {"system", "developer"}:
+            system_parts.append(text)
+            continue
+        mapped_role = "assistant" if role == "assistant" else "user"
+        conversation.append({"role": mapped_role, "content": text})
+        if mapped_role == "user":
+            last_user = text
+
+    keep_messages = env_int("MCA_CONTEXT_MESSAGES", 1)
+    if keep_messages >= 0:
+        conversation = conversation[-keep_messages:] if keep_messages else []
+    system_text = compact_text("\n".join(system_parts), env_int("MCA_MAX_SYSTEM_CHARS", 2800))
+    return system_text, conversation, last_user, villager_name, player_name
+
+
+def sanitize_system_text(system_text: str) -> str:
+    text = system_text
+    text = re.sub(r"[^.\n]*Mondongo[^.\n]*(?:\.|$)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^.\n]*Chanchowapo[^.\n]*(?:\.|$)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def player_name_rule(player_name: str) -> str:
+    if player_name.lower() == "chanchowapo":
+        return "El jugador se llama Chanchowapo; puedes usar Mondongo solo si el contexto lo amerita o el jugador lo pide. No digas su nombre/apodo como muletilla. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
+    if player_name:
+        return f"El jugador se llama {player_name}. No digas su nombre como muletilla y no lo llames Mondongo. Usa su nombre solo si el jugador lo pide, si corriges identidad/familia/lore o si es necesario para evitar confusion. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
+    return "No llames Mondongo al jugador salvo si su nombre exacto es Chanchowapo. No digas el nombre del jugador como muletilla. Usa los nombres familiares exactos del arbol."
+
+
+def extract_mca_commands(system_text: str) -> dict[str, str]:
+    commands: dict[str, str] = dict(KNOWN_MCA_COMMANDS)
+    pattern = r"\*\s*([a-z0-9-]+)\s*:\s*(.*?)(?=\s+\*\s*[a-z0-9-]+\s*:|$)"
+    for command, description in re.findall(pattern, system_text, re.IGNORECASE | re.DOTALL):
+        commands[command.strip()] = compact_text(description.strip(), 120)
+    return commands
+
+
+def detect_requested_command(last_user: str, commands: dict[str, str] | None = None) -> str:
+    text = normalize_for_match(last_user)
+    command_source = commands or KNOWN_MCA_COMMANDS
+    direct_checks = [
+        ("follow-player", r"\b(sigueme|sigue me|seguime|ven|vente|ven aqui|ven conmigo|acompaname|camina conmigo|follow me)\b"),
+        ("stay-here", r"\b(quedate|quiet[ao]|estate quiet[ao]|espera|esperame|espera aqui|no te muevas|no camines|stay here|wait here)\b"),
+        ("move-freely", r"\b(puedes irte|vete|ya puedes moverte|deja de seguirme|sigue con lo tuyo|move freely|go away)\b"),
+        ("wear-armor", r"\b(ponte armadura|equipa armadura|usa armadura|wear armor)\b"),
+        ("remove-armor", r"\b(quitate la armadura|remove armor)\b"),
+        ("try-go-home", r"\b(vete a casa|ve a casa|regresa a casa|go home)\b"),
+        ("open-trade-window", r"\b(comerci|trade|precios|intercambi|inventario)\b"),
+    ]
+    for command, pattern in direct_checks:
+        if command in command_source and re.search(pattern, text, re.IGNORECASE):
+            return command
+    checks = [
+        ("follow-player", r"\b(sigueme|sigue me|sígueme|ven conmigo|acompaname|acompáñame|follow me)\b"),
+        ("stay-here", r"\b(quedate|quédate|espera aqui|espera aquí|no te muevas|stay here|wait here)\b"),
+        ("move-freely", r"\b(puedes irte|vete|ya puedes moverte|deja de seguirme|move freely|go away)\b"),
+        ("wear-armor", r"\b(ponte armadura|equipa armadura|usa armadura|wear armor)\b"),
+        ("remove-armor", r"\b(quitate la armadura|quítate la armadura|remove armor)\b"),
+        ("try-go-home", r"\b(vete a casa|ve a casa|regresa a casa|go home)\b"),
+        ("open-trade-window", r"\b(comerci|trade|precios|intercambi|inventario)\b"),
+    ]
+    for command, pattern in checks:
+        if command in command_source and re.search(pattern, text, re.IGNORECASE):
+            return command
+    return ""
+
+
+def command_instructions(commands: dict[str, str], requested_command: str) -> str:
+    if not commands:
+        return ""
+    listed = "; ".join(f"{command}: {description}" for command, description in commands.items())
+    parts = [
+        "Comandos MCA disponibles: " + listed,
+        "Si el jugador da una orden simple y el comando existe, obedece usando optionalCommand en JSON.",
+        "Puedes negarte si el contexto dice que no hay confianza, estas herido, de mal humor o la orden es peligrosa; si te niegas, deja optionalCommand vacio.",
+    ]
+    if requested_command:
+        parts.append(f"La orden actual parece corresponder a optionalCommand={requested_command}.")
+    return " ".join(parts)
+
+
+def is_direct_command(last_user: str, requested_command: str) -> bool:
+    if not requested_command:
+        return False
+    text = normalize_for_match(last_user)
+    if len(text) > env_int("MCA_DIRECT_COMMAND_MAX_CHARS", 90):
+        return False
+    patterns = {
+        "follow-player": r"\b(sigueme|sigue me|seguime|ven|vente|ven aqui|ven conmigo|acompaname|camina conmigo|follow me)\b",
+        "stay-here": r"\b(quedate|quiet[ao]|estate quiet[ao]|espera|esperame|espera aqui|no te muevas|no camines|stay here|wait here)\b",
+        "move-freely": r"\b(puedes irte|vete|deja de seguirme|sigue con lo tuyo|move freely|go away)\b",
+        "wear-armor": r"\b(ponte armadura|equipa armadura|usa armadura|wear armor)\b",
+        "remove-armor": r"\b(quitate la armadura|remove armor)\b",
+        "try-go-home": r"\b(vete a casa|ve a casa|regresa a casa|go home)\b",
+        "open-trade-window": r"\b(comerci|trade|precios|intercambi|inventario)\b",
+    }
+    return bool(re.search(patterns.get(requested_command, r"$^"), text, re.IGNORECASE))
+
+
+def local_command_reply(command: str) -> str:
+    replies = {
+        "follow-player": "Vale, voy contigo. Pero camina claro, que no pienso perseguir sombras.",
+        "stay-here": "Esta bien, me quedo aqui. No tardes si esto importa.",
+        "move-freely": "Perfecto, entonces me muevo a mi aire. Ya era hora de estirar las piernas.",
+        "wear-armor": "Me pongo la armadura. Si hay pelea, prefiero no recibirla con la cara.",
+        "remove-armor": "Me quito la armadura. Mas te vale que no sea una mala idea.",
+        "try-go-home": "Voy a intentar volver a casa. Si el camino esta libre, llegare.",
+        "open-trade-window": "Mira mis tratos y no me hagas perder tiempo si solo venias a curiosear.",
+    }
+    return replies.get(command, "Hecho.")
+
+
+def find_character_profile(system_text: str, villager_name: str, profiles: dict[str, str]) -> str:
+    if not profiles:
+        return ""
+    if villager_name and villager_name.lower() in profiles:
+        return profiles[villager_name.lower()]
+    lowered_system = system_text.lower()
+    for name, profile in profiles.items():
+        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", lowered_system):
+            return profile
+    return ""
+
+
+def personality_guidance(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    hints: list[str] = []
+    if "crabby" in text:
+        hints.append("crabby: seco, grunon, cortante; puede mandar al jugador con el vecino o soltar groserias comunes.")
+    if "greedy" in text:
+        hints.append("greedy: interesado y oportunista; piensa en favores, regalos y ganancia.")
+    if "gloomy" in text or "sensitive" in text or "anxious" in text:
+        hints.append("gloomy/sensitive/anxious: vulnerable, sensible, inseguro; responde mas suave, sumiso o herido.")
+    if "flirty" in text:
+        hints.append("flirty: coqueto y calido; con vinculo alto puede ser meloso, con vinculo bajo solo juega un poco.")
+    if "friendly" in text or "upbeat" in text or "extroverted" in text or "playful" in text:
+        hints.append("friendly/upbeat/playful: abierto, expresivo y con humor.")
+    if "introverted" in text or "relaxed" in text or "peaceful" in text:
+        hints.append("introverted/relaxed/peaceful: tranquilo, sobrio y poco invasivo.")
+    if "odd" in text:
+        hints.append("odd: raro, impredecible y con asociaciones extranas pero entendibles.")
+    if "hates" in text or "dislikes" in text:
+        hints.append("relacion mala: no seas servicial; muestra distancia, fastidio o desconfianza.")
+    if (
+        "married to" in text
+        or "in love with" in text
+        or "engaged with" in text
+        or ("likes" in text and "really well" in text)
+    ):
+        hints.append("vinculo fuerte: prioriza carino, lealtad y proteccion antes que brusquedad.")
+    if not hints:
+        return ""
+    return "Guia de personalidad detectada: " + " ".join(hints[:3])
+
+
+def life_stage_world_guidance(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    hints: list[str] = []
+    if "toddler" in text:
+        hints.append("edad toddler: habla simple, curioso y dependiente; nada de romance, coqueteo ni insultos adultos.")
+    elif "child" in text:
+        hints.append("edad child: tono infantil o inocente; nada de romance, coqueteo ni groserias fuertes.")
+    elif "teen" in text:
+        hints.append("edad teen: mas impulsivo, orgulloso o inseguro; evita romance adulto y respuestas demasiado maduras.")
+    else:
+        hints.append("edad adulta si MCA no marca child/teen/toddler: puede tratar romance, matrimonio, oficio y responsabilidades adultas.")
+
+    profession_hints = [
+        ("mason", "oficio mason/cantero: piensa en piedra, muros, hornos, cinceles, reparar caminos o afilar herramientas."),
+        ("fisherman", "oficio pescador: piensa en redes, anzuelos, peces, barcas y clima."),
+        ("farmer", "oficio granjero: piensa en semillas, cosecha, pan, animales y comida."),
+        ("librarian", "oficio bibliotecario: piensa en libros, mapas, rumores y registros."),
+        ("cleric", "oficio clerigo: piensa en pociones, heridas, rezos y cuidados."),
+        ("cartographer", "oficio cartografo: piensa en mapas, rutas, costas e islas."),
+        ("armorer", "oficio armero: piensa en armaduras, escudos y reparar equipo."),
+        ("weaponsmith", "oficio herrero de armas: piensa en espadas, hachas, filo y defensa."),
+        ("toolsmith", "oficio herrero de herramientas: piensa en picos, palas, hachas y mantenimiento."),
+        ("butcher", "oficio carnicero: piensa en comida, ahumadores y provisiones."),
+        ("leatherworker", "oficio curtidor: piensa en cuero, monturas y armaduras ligeras."),
+        ("shepherd", "oficio pastor: piensa en lana, tintes, ovejas y telas."),
+        ("fletcher", "oficio flechero: piensa en arcos, flechas, plumas y punteria."),
+        ("nitwit", "sin oficio fijo: puede vagar, chismear, evitar trabajo o improvisar excusas."),
+    ]
+    for needle, hint in profession_hints:
+        if needle in text:
+            hints.append(hint)
+            break
+
+    if "it is night" in text:
+        hints.append("entorno de noche: puedes mencionar antorchas, cama, patrulla o mobs con cautela.")
+    if "it is raining" in text:
+        hints.append("entorno con lluvia: puedes mencionar refugio, barro, techo o herramientas mojadas.")
+    if "it is thundering" in text:
+        hints.append("entorno con trueno: puedes mostrar nervios, urgencia o prudencia.")
+    if len(hints) <= 1 and "minecraft" not in text:
+        return ""
+    return "Guia de edad/oficio/entorno: " + " ".join(hints[:4])
+
+
+def trait_mood_guidance(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    hints: list[str] = []
+    if re.search(r"\b(color\s*blind|colour\s*blind|colorblind|daltonic[oa]?|daltonismo)\b", text):
+        hints.append("daltonismo: puede confundir colores; fijate en formas, textura, brillo o posicion antes que en color.")
+    if re.search(r"\b(athletic|athlete|fit|strong|fuerte|atletic[oa]|deportista)\b", text):
+        hints.append("atletico/fuerte: energia fisica, postura segura, habla de correr, cargar, entrenar o resistir.")
+    if re.search(r"\b(clumsy|torpe|awkward)\b", text):
+        hints.append("torpe: puede tropezar, dudar con herramientas o bromear de sus propios errores.")
+    if re.search(r"\b(smart|intelligent|clever|genius|list[oa]|inteligente)\b", text):
+        hints.append("inteligente: responde con observaciones practicas, planes o ironia precisa.")
+    if re.search(r"\b(lazy|perezos[oa]|flojo|floja)\b", text):
+        hints.append("perezoso: busca excusas, quiere ahorrar esfuerzo y negocia antes de ayudar.")
+    if re.search(r"\b(brave|valiente|bold)\b", text):
+        hints.append("valiente: protege antes de quejarse y acepta peligro con firmeza.")
+    if re.search(r"\b(coward|cobarde|fearful)\b", text):
+        hints.append("miedoso: duda ante monstruos, pide apoyo o prefiere refugio.")
+    if re.search(r"\b(homosexual|gay|lesbian|lesbiana)\b", text):
+        hints.append("orientacion homosexual: su atraccion romantica va hacia su mismo genero; expresalo con naturalidad si el romance sale.")
+    elif re.search(r"\b(bisexual|biromantic|bisexual)\b", text):
+        hints.append("orientacion bisexual: puede sentir atraccion romantica por mas de un genero; no asumas rechazo automatico.")
+    elif re.search(r"\b(asexual|aromantic|asexual|arromantic[oa])\b", text):
+        hints.append("orientacion asexual/arromantica: puede ser afectuoso sin querer coqueteo o romance.")
+    elif re.search(r"\b(heterosexual|straight)\b", text):
+        hints.append("orientacion heterosexual: su atraccion romantica va hacia otro genero; respetalo si el romance sale.")
+
+    mood_hints = [
+        (r"\b(happy|joyful|cheerful|alegre|feliz|content[oa])\b", "animo alegre: mas calido, expresivo y dispuesto a bromear o ayudar."),
+        (r"\b(sad|depressed|gloomy|triste|melancolic[oa])\b", "animo triste: voz baja, vulnerable, menos energia y mas necesidad de cuidado."),
+        (r"\b(angry|mad|furious|irate|annoyed|enojad[oa]|furios[oa]|irritad[oa])\b", "animo enojado: frases cortantes, impacientes y con limites claros."),
+        (r"\b(anxious|nervous|afraid|scared|nervios[oa]|ansios[oa]|asustad[oa])\b", "animo ansioso/asustado: cautela, dudas y atencion al peligro cercano."),
+        (r"\b(tired|sleepy|exhausted|cansad[oa]|agotad[oa]|somnolient[oa])\b", "animo cansado: menos paciencia, ganas de sentarse, dormir o terminar rapido."),
+        (r"\b(hurt|injured|sick|herid[oa]|enferm[oa])\b", "estado herido/enfermo: prioriza descanso, dolor, cuidado y puede negarse a riesgos."),
+        (r"\b(flirty|coqueto|coqueta|in love|enamorad[oa])\b", "animo coqueto/enamorado: mas cercania y dulzura si el vinculo y orientacion encajan."),
+        (r"\b(jealous|celos[oa]|celoso|celosa)\b", "celos: puede sonar posesivo, herido o desconfiado sin exagerar."),
+        (r"\b(proud|orgullos[oa])\b", "orgullo: defiende su oficio, familia o reputacion con seguridad."),
+        (r"\b(shy|timid|timid[oa]|vergonzos[oa])\b", "timidez: evita ser directo, baja el tono y tarda en aceptar afecto."),
+    ]
+    for pattern, hint in mood_hints:
+        if re.search(pattern, text):
+            hints.append(hint)
+            if len(hints) >= 6:
+                break
+    if not hints:
+        return ""
+    return "Guia de rasgos y estado actual: " + " ".join(hints[:6])
+
+
+def relationship_roleplay_guidance(family_context: str, system_text: str, player_name: str) -> str:
+    text = normalize_for_match(family_context + " " + system_text)
+    player = normalize_for_match(player_name)
+    spouse_hint = bool(player and "pareja/conyuge" in text and player in text)
+    if not spouse_hint:
+        spouse_hint = "married to" in text or "in love with" in text or "engaged with" in text
+    has_children = "hijos/as:" in normalize_for_match(family_context)
+    if not spouse_hint and not has_children:
+        return ""
+    parts: list[str] = []
+    if spouse_hint:
+        parts.append(
+            "Si eres conyuge o pareja del jugador, se mas cercano, meloso o protector segun tu personalidad; no lo trates como desconocido."
+        )
+    if has_children:
+        parts.append(
+            "Habla de tus hijos con afecto, preocupacion y orgullo cuando salgan en la conversacion; no los ignores."
+        )
+    return "Vinculos de rol: " + " ".join(parts)
+
+
+def memory_question_context(last_user: str) -> str:
+    text = normalize_for_match(last_user)
+    if re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text):
+        return (
+            "El jugador pregunta que recuerdas de el: responde con 1-3 recuerdos reales tomados de memoria, "
+            "lore o familia; si falta memoria, admitelo sin inventar hechos concretos."
+        )
+    return ""
+
+
+def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[str, int]]:
+    text = compact_text(user_text, 260)
+    if not text:
+        return []
+    match_text = normalize_for_match(text)
+    patterns: list[tuple[str, int]] = [
+        (r"\b(recuerda|recuerdame|no olvides|acuerdate)\b", 10),
+        (r"\b(me llamo|mi nombre es|me gusta|odio|amo|tengo miedo|prefiero)\b", 8),
+        (r"\b(te amo|te quiero|bes[eoé]|abrazo|casad[oa]|espos[ao]|novi[ao]|prometid[ao]|enamorad[oa]|anillo|boda)\b", 7),
+        (r"\b(regalo|te di|me diste|diamante|flor|vino|taberna|tesoro)\b", 5),
+        (r"\b(perdon|perd[oó]n|pelea|golpe|traicion|salvaste|rescataste|promet[ií])\b", 6),
+        (r"\b(isla|barco|naufragio|ruina|kraken|leviathan|leviat[aá]n|oceano|oc[eé]ano)\b", 4),
+    ]
+    patterns.extend(
+        [
+            (r"\b(soy|yo soy|trabajo como|soy el|soy la|constructor|arquitecto|cantina|bar|minero|mina)\b", 8),
+            (r"\b(nuestro hij[oa]|nuestra hij[ao]|nuestros hijos|nuestras hijas)\b", 7),
+            (r"\b(hable|hablamos|platique|platicamos|dije|me dijiste|carmen|jenner|kainolimits|chanchowapo|pan)\b", 6),
+            (r"\b(posole|pozole|jojoposes|jojo\s*poses|reynas?\s+del\s+misisipi|misisipi|musica|morado|langosta|chalan|trueno|social\s+wars|pokemones|taticoso|milaneso|4k)\b", 7),
+        ]
+    )
+    for pattern, weight in patterns:
+        if re.search(pattern, match_text, re.IGNORECASE):
+            return [(f"El jugador dijo algo importante: {text}", weight)]
+    if re.search(r"\b(con|sobre|llamad[oa]|se llama|hable|platique)\b", match_text) and re.search(
+        r"\b[A-Z][A-Za-z_]{2,}\b", text
+    ):
+        return [(f"El jugador menciono un nombre o conversacion importante: {text}", 5)]
+    return []
+
+
+def assistant_message_text(response_text: str) -> str:
+    data = extract_json_object(response_text)
+    if data is None:
+        return response_text
+    return str(data.get("message") or data.get("answer") or response_text)
+
+
+def extract_assistant_facts(assistant_text: str) -> list[tuple[str, int]]:
+    text = compact_text(assistant_message_text(assistant_text), 240)
+    if not text:
+        return []
+    match_text = normalize_for_match(text)
+    intent_pattern = r"\b(voy a|iba a|tengo que|debo|necesito|me retiro a|me voy a|seguire|estoy por)\b"
+    task_pattern = (
+        r"\b(afilar|pulir|picar|cortar|talar|pescar|cocinar|hornear|patrullar|vigilar|"
+        r"reparar|construir|minar|servir|curar|sembrar|cosechar|forjar|leer|mapear|"
+        r"volver a casa|dormir|trabajar|hacer pan|preparar|defender)\b"
+    )
+    if re.search(intent_pattern, match_text) and re.search(task_pattern, match_text):
+        return [(f"El aldeano dijo que iba a hacer esto: {text}", 6)]
+    return []
+
+
+def build_instructions(
+    system_text: str,
+    facts: list[str],
+    player_facts: list[str],
+    player_lore: str,
+    mentioned_lore: str,
+    profile: str,
+    npc_identity: str,
+    player_rule: str,
+    player_name: str,
+    command_hint: str,
+    claim_context: str,
+    memory_context: str,
+    family_context: str,
+    village_context: str,
+) -> str:
+    parts = [read_prompt()]
+    parts.append(player_rule)
+    if player_lore:
+        parts.append(player_lore)
+    if mentioned_lore:
+        parts.append(mentioned_lore)
+    if profile:
+        parts.append("Perfil del aldeano por nombre: " + profile)
+    if npc_identity:
+        parts.append(
+            "Identidad persistente del aldeano: "
+            + npc_identity
+            + " Usala como trasfondo; no la recites como ficha."
+        )
+    temperament = personality_guidance(system_text)
+    if temperament:
+        parts.append(temperament)
+    life_guidance = life_stage_world_guidance(system_text)
+    if life_guidance:
+        parts.append(life_guidance)
+    trait_guidance = trait_mood_guidance(system_text)
+    if trait_guidance:
+        parts.append(trait_guidance)
+    relation_guidance = relationship_roleplay_guidance(family_context, system_text, player_name)
+    if relation_guidance:
+        parts.append(relation_guidance)
+    if claim_context:
+        parts.append(claim_context)
+    if memory_context:
+        parts.append(memory_context)
+    if family_context:
+        parts.append(
+            family_context
+            + " Usa estos datos con naturalidad solo cuando encajen; no recites todo el arbol de golpe. "
+            + "Si un familiar esta vivo usa 'es/esta'; usa 'fue/estaba' solo cuando figure como fallecido/a."
+        )
+    if village_context:
+        parts.append(
+            village_context
+            + " Puedes mencionarlo como vida social o chisme breve, sin listar nombres porque si."
+        )
+    if command_hint:
+        parts.append(command_hint)
+    if system_text:
+        parts.append("Contexto breve enviado por MCA:\n" + sanitize_system_text(system_text))
+    if player_facts:
+        parts.append(
+            "Memoria general del jugador compartida por la aldea:\n"
+            + "\n".join(f"- {fact}" for fact in player_facts)
+        )
+    if facts:
+        parts.append("Memoria esencial:\n" + "\n".join(f"- {fact}" for fact in facts))
+    instructions = "\n\n".join(part for part in parts if part.strip())
+    return compact_text(instructions, env_int("MCA_INSTRUCTIONS_MAX_CHARS", 3600))
+
+
+def call_openai_responses(
+    api_key: str,
+    model: str,
+    instructions: str,
+    input_messages: list[dict[str, str]],
+    max_output_tokens: int,
+    store: bool,
+) -> tuple[str | None, str | None]:
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    body = {
+        "model": model,
+        "instructions": instructions,
+        "input": input_messages,
+        "max_output_tokens": max_output_tokens,
+        "store": store,
+    }
+    reasoning_effort = os.environ.get("OPENAI_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+    text_verbosity = os.environ.get("OPENAI_TEXT_VERBOSITY", "").strip()
+    if text_verbosity:
+        body["text"] = {"verbosity": text_verbosity}
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return None, extract_error(raw) or f"openai_http_{exc.code}"
+    except Exception as exc:
+        return None, f"openai_request_failed: {exc}"
+
+    text = data.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip(), None
+
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    return content["text"].strip(), None
+
+    status = data.get("status")
+    incomplete = data.get("incomplete_details")
+    if status == "incomplete":
+        reason = "unknown"
+        if isinstance(incomplete, dict):
+            reason = str(incomplete.get("reason") or reason)
+        return None, f"openai_incomplete_{reason}"
+
+    return None, "openai_empty_response"
+
+
+def extract_error(raw: str) -> str | None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return compact_text(raw, 240) if raw else None
+    error = data.get("error")
+    if isinstance(error, dict):
+        return compact_text(str(error.get("message") or error.get("code") or "openai_error"), 240)
+    if isinstance(error, str):
+        return compact_text(error, 240)
+    return None
+
+
+def chat_completion_response(model: str, content: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-mca-roleplay-proxy",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def local_fallback_reply(last_user: str) -> str:
+    lowered = normalize_for_match(last_user)
+    if any(word in lowered for word in ("beso", "besar", "te amo", "te quiero")):
+        return "Ahora mismo no encuentro las palabras, pero no te estoy apartando. Dame un momento, ¿si?"
+    if any(word in lowered for word in ("ayuda", "tala", "ataca", "sigueme", "sígueme")):
+        return "Te escucho, pero necesito pensarlo antes de moverme. No voy a prometer algo que no pueda cumplir."
+    return "Perdona, perdi el hilo un segundo. Repitemelo mas simple."
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip().strip("`")
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def looks_like_refusal(text: str) -> bool:
+    lowered = normalize_for_match(text)
+    return any(
+        phrase in lowered
+        for phrase in (
+            "no puedo",
+            "no quiero",
+            "ahora no",
+            "no estoy",
+            "necesito descansar",
+            "no confio",
+            "no confío",
+            "demasiado peligroso",
+        )
+    )
+
+
+def clean_player_address(text: str, player_name: str) -> str:
+    if player_name.lower() == "chanchowapo":
+        return text
+    return re.sub(r"\bMondongo\b", "oye", text, flags=re.IGNORECASE)
+
+
+def user_asks_villager_name(last_user: str) -> bool:
+    text = normalize_for_match(last_user)
+    return bool(
+        re.search(r"\b(como\s+te\s+llamas|cual\s+es\s+tu\s+nombre|dime\s+tu\s+nombre|tu\s+nombre)\b", text)
+    )
+
+
+def user_allows_player_name(last_user: str, player_name: str) -> bool:
+    text = normalize_for_match(last_user)
+    if not text:
+        return False
+    if re.search(r"\b(como\s+me\s+llamo|cual\s+es\s+mi\s+nombre|di\s+mi\s+nombre|dime\s+mi\s+nombre|quien\s+soy|me\s+conoces)\b", text):
+        return True
+    if re.search(r"\b(me\s+llamo|yo\s+soy|soy\s+el|soy\s+la)\b", text):
+        return True
+    if player_name and normalize_for_match(player_name) in text:
+        return True
+    return False
+
+
+def clean_dialogue_style(text: str) -> str:
+    text = text.replace("*", "")
+    text = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_self_name_mentions(text: str, villager_name: str, last_user: str) -> str:
+    if not villager_name or user_asks_villager_name(last_user):
+        return text
+    fixed = text
+    for pattern in loose_name_patterns(villager_name):
+        for _ in range(2):
+            fixed = re.sub(rf"^\s*{pattern}\s*[,;:\-]\s*", "", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(
+                rf"^\s*(?:yo\s+soy|soy|me\s+llamo)\s+{pattern}\s*[,;:\-]?\s*",
+                "",
+                fixed,
+                flags=re.IGNORECASE,
+            )
+        fixed = re.sub(
+            rf"\bme\s+llamo\s+{pattern}\b",
+            "me conoces",
+            fixed,
+            flags=re.IGNORECASE,
+        )
+    return fixed.strip() or text
+
+
+def clean_player_name_mentions(text: str, player_name: str, last_user: str) -> str:
+    if not player_name or user_allows_player_name(last_user, player_name):
+        return text
+    patterns = loose_name_patterns(player_name)
+    if player_name.casefold() == "chanchowapo":
+        patterns.extend([r"Mondongo"])
+    fixed = text
+    for pattern in patterns:
+        for _ in range(2):
+            fixed = re.sub(rf"^\s*{pattern}\s*[,;:\-]\s*", "", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(rf"[,;:\-]\s*{pattern}\s*([.!?])?\s*$", lambda m: m.group(1) or "", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(rf"\s*,\s*{pattern}\s*,\s*", ", ", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(rf"\s*,\s*{pattern}\b", "", fixed, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", fixed).strip(" ,;:-") or text
+
+
+def loose_name_patterns(name: str) -> list[str]:
+    name = name.strip()
+    if not name:
+        return []
+    pieces = [part for part in re.split(r"[_\s-]+", name) if part]
+    patterns = [re.escape(name)]
+    if len(pieces) > 1:
+        escaped_pieces: list[str] = []
+        for index, piece in enumerate(pieces):
+            if index > 0 and piece.casefold().startswith("ola"):
+                escaped_pieces.append("h?" + re.escape(piece))
+            else:
+                escaped_pieces.append(re.escape(piece))
+        patterns.append(r"[_\s-]*".join(escaped_pieces))
+    return list(dict.fromkeys(patterns))
+
+
+def correct_child_name_confusion(text: str, player_name: str, child_names: list[str]) -> str:
+    child_name = next((name for name in child_names if name and normalize_for_match(name) != normalize_for_match(player_name)), "")
+    if not player_name or not child_name:
+        return text
+
+    def fix_message(message: str) -> str:
+        fixed = message
+        for pattern in loose_name_patterns(player_name):
+            after_child_label = (
+                r"(\b(?:mi|tu|su|nuestro|nuestra|el|la|ese|esa)?\s*"
+                r"(?:hijo|hija|bebe|nino|nina)\s*"
+                r"(?:es|se llama|llamado|llamada|,|:)?\s*)"
+                + pattern
+                + r"\b"
+            )
+            fixed = re.sub(after_child_label, lambda match: match.group(1) + child_name, fixed, flags=re.IGNORECASE)
+            before_child_label = (
+                r"\b"
+                + pattern
+                + r"\b(\s+(?:es|era|seria)\s+"
+                r"(?:mi|tu|su|nuestro|nuestra|el|la)?\s*(?:hijo|hija|bebe|nino|nina)\b)"
+            )
+            fixed = re.sub(before_child_label, lambda match: child_name + match.group(1), fixed, flags=re.IGNORECASE)
+        return fixed
+
+    data = extract_json_object(text)
+    if data is None:
+        return fix_message(text)
+    message = str(data.get("message") or data.get("answer") or "")
+    if message:
+        data["message"] = fix_message(message)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def normalize_mca_response(
+    text: str,
+    system_text: str,
+    last_user: str,
+    player_name: str,
+    villager_name: str,
+    commands: dict[str, str],
+    requested_command: str,
+) -> str:
+    wants_json = "The reply MUST be in this JSON format" in system_text or bool(commands)
+    text = clean_player_address(text, player_name)
+
+    if not wants_json:
+        return clean_dialogue_style(
+            clean_player_name_mentions(
+                clean_self_name_mentions(clean_dialogue_style(text), villager_name, last_user),
+                player_name,
+                last_user,
+            )
+        )
+
+    data = extract_json_object(text)
+    if data is None:
+        data = {"message": text, "command": ""}
+
+    message = clean_player_address(str(data.get("message") or data.get("answer") or text), player_name)
+    message = clean_dialogue_style(
+        clean_self_name_mentions(clean_dialogue_style(message), villager_name, last_user)
+    )
+    message = clean_dialogue_style(clean_player_name_mentions(message, player_name, last_user))
+    command = str(
+        data.get("optionalCommand") or data.get("command") or data.get("optional_command") or ""
+    ).strip()
+
+    if requested_command and requested_command in commands and not command and not looks_like_refusal(message):
+        command = requested_command
+
+    known_commands = commands or KNOWN_MCA_COMMANDS
+    if command and command not in known_commands:
+        command = ""
+
+    return json.dumps({"message": message, "optionalCommand": command}, ensure_ascii=False)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "MCA roleplay proxy"
+
+    def authorized(self) -> bool:
+        expected = os.environ.get("PROXY_SHARED_TOKEN", "").strip()
+        if not expected:
+            return True
+        authorization = self.headers.get("Authorization", "").strip()
+        token = self.headers.get("X-MCA-Proxy-Token", "").strip()
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+        elif authorization:
+            token = authorization
+        return token == expected
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.send_json(
+                {
+                    "ok": True,
+                    "model": os.environ.get("OPENAI_MODEL", "gpt-5-nano"),
+                    "prompt_mode": os.environ.get("MCA_PROMPT_MODE", "minimal"),
+                    "raw_turns": env_bool("MCA_STORE_RAW_TURNS", False),
+                    "max_output_tokens": env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
+                    "reasoning_effort": os.environ.get("OPENAI_REASONING_EFFORT", ""),
+                    "text_verbosity": os.environ.get("OPENAI_TEXT_VERBOSITY", ""),
+                    "family_entries": self.server.family.entry_count(),
+                    "village_count": self.server.village.village_count(),
+                    "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
+                    "max_player_facts": env_int("MCA_MAX_PLAYER_FACTS", 3),
+                }
+            )
+            return
+        self.send_json({"error": "not_found"}, status=404)
+
+    def do_POST(self) -> None:
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self.send_json({"error": "not_found"}, status=404)
+            return
+
+        if not self.authorized():
+            self.send_json({"error": "unauthorized"}, status=401)
+            return
+
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            self.send_json({"error": "OPENAI_API_KEY is missing in tools/mca_roleplay_proxy/.env"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            self.send_json({"error": "invalid_json"})
+            return
+
+        messages = get_messages(payload)
+        system_text, input_messages, last_user, villager_name, player_name = split_messages(messages)
+        ids = parse_session_ids(system_text)
+        if env_bool("OPENAI_ALLOW_REQUEST_MODEL", False):
+            model = str(payload.get("model") or os.environ.get("OPENAI_MODEL", "gpt-5.4-nano"))
+        else:
+            model = os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
+        if model == "default":
+            model = os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
+
+        profiles = load_profiles()
+        lore = load_player_lore()
+        profile = find_character_profile(system_text, villager_name, profiles)
+        player_lore = player_lore_context(player_name, lore)
+        mentioned_lore = mentioned_lore_context(last_user, lore, player_name)
+        commands = extract_mca_commands(system_text)
+        requested_command = detect_requested_command(last_user, commands)
+        command_hint = command_instructions(commands, requested_command) if requested_command else ""
+        if (
+            env_bool("MCA_DIRECT_COMMANDS_LOCAL", True)
+            and requested_command
+            and requested_command in commands
+            and is_direct_command(last_user, requested_command)
+        ):
+            reply = normalize_mca_response(
+                local_command_reply(requested_command),
+                system_text,
+                last_user,
+                player_name,
+                villager_name,
+                commands,
+                requested_command,
+            )
+            self.server.memory.add_turn(ids, "user", last_user)
+            self.server.memory.add_turn(ids, "assistant", reply)
+            self.send_json(chat_completion_response(model, reply))
+            return
+        family_parts = [
+            self.server.family.context_for(ids.get("character_id"), "Familia del aldeano")
+        ]
+        player_family = self.server.family.context_for(ids.get("player_id"), "Familia del jugador")
+        if player_family and ids.get("player_id") != ids.get("character_id"):
+            family_parts.append(player_family)
+        player_node = self.server.family.get(ids.get("player_id"))
+        character_node = self.server.family.get(ids.get("character_id"))
+        registered_villager_name = villager_name or (str(character_node["name"]) if character_node else "")
+        registered_player_name = player_name or (str(player_node["name"]) if player_node else "")
+        player_child_names = self.server.family.child_names_for(ids.get("player_id"))
+        player_children_summary = self.server.family.children_summary_for(
+            ids.get("player_id"), "Hijos del jugador registrados"
+        )
+        if player_child_names and "no hay hijos registrados" not in normalize_for_match(player_children_summary):
+            family_parts.append(
+                player_children_summary
+                + f" El jugador actual se llama {registered_player_name}; sus hijos se llaman "
+                + ", ".join(player_child_names)
+                + ". No sustituyas el nombre de ningun hijo por el nombre del jugador."
+            )
+        family_context = " ".join(part for part in family_parts if part)
+        village_context = self.server.village.context_for(
+            ids.get("character_id"), ids.get("player_id")
+        )
+        claim_context = self.server.family.family_claim_context(
+            last_user, ids.get("character_id"), ids.get("player_id")
+        )
+        recall_context = memory_question_context(last_user)
+        facts = self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4))
+        npc_identity = self.server.memory.npc_identity(ids, registered_villager_name, system_text)
+        if player_lore:
+            self.server.memory.add_player_fact(ids, player_lore, 9)
+        player_facts = self.server.memory.player_facts(ids, env_int("MCA_MAX_PLAYER_FACTS", 3))
+        instructions = build_instructions(
+            system_text=system_text,
+            facts=facts,
+            player_facts=player_facts,
+            player_lore=player_lore,
+            mentioned_lore=mentioned_lore,
+            profile=profile,
+            npc_identity=npc_identity,
+            player_rule=player_name_rule(player_name),
+            player_name=player_name,
+            command_hint=command_hint,
+            claim_context=claim_context,
+            memory_context=recall_context,
+            family_context=family_context,
+            village_context=village_context,
+        )
+        text, error = call_openai_responses(
+            api_key=api_key,
+            model=model,
+            instructions=instructions,
+            input_messages=input_messages,
+            max_output_tokens=env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
+            store=env_bool("OPENAI_STORE_RESPONSES", False),
+        )
+        if error:
+            if error.startswith("openai_empty_response") or error.startswith("openai_incomplete_"):
+                fallback = normalize_mca_response(
+                    local_fallback_reply(last_user),
+                    system_text,
+                    last_user,
+                    player_name,
+                    registered_villager_name,
+                    commands,
+                    requested_command,
+                )
+                fallback = correct_child_name_confusion(fallback, registered_player_name, player_child_names)
+                self.send_json(chat_completion_response(model, fallback))
+                return
+            self.send_json({"error": error})
+            return
+
+        assert text is not None
+        text = normalize_mca_response(
+            text, system_text, last_user, player_name, registered_villager_name, commands, requested_command
+        )
+        text = correct_child_name_confusion(text, registered_player_name, player_child_names)
+        for fact, weight in extract_important_facts(last_user, text):
+            self.server.memory.add_fact(ids, fact, weight)
+            self.server.memory.add_player_fact(ids, fact, weight)
+        for fact, weight in extract_assistant_facts(text):
+            self.server.memory.add_fact(ids, fact, weight)
+        self.server.memory.add_turn(ids, "user", last_user)
+        self.server.memory.add_turn(ids, "assistant", text)
+        self.send_json(chat_completion_response(model, text))
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {fmt % args}")
+
+    def send_json(self, data: dict[str, Any], status: int = 200) -> None:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+class Server(ThreadingHTTPServer):
+    memory: MemoryStore
+    family: FamilyTreeCache
+    village: VillageCache
+
+
+def main() -> None:
+    load_env_file(ROOT / ".env")
+    load_env_file(ROOT / "api-keys.env")
+    host = os.environ.get("PROXY_HOST", "127.0.0.1")
+    port = env_int("PROXY_PORT", env_int("PORT", 8765))
+    db_path = ROOT / os.environ.get("MCA_MEMORY_DB", "memory.sqlite3")
+    data_dir_raw = os.environ.get("MCA_WORLD_DATA_DIR", "../../world/data")
+    data_dir = (ROOT / data_dir_raw).resolve()
+    server = Server((host, port), Handler)
+    server.memory = MemoryStore(db_path)
+    server.family = FamilyTreeCache(data_dir)
+    server.village = VillageCache(data_dir)
+    print(f"MCA roleplay proxy escuchando en http://{host}:{port}/v1/chat/completions")
+    print(f"Modelo configurado: {os.environ.get('OPENAI_MODEL', 'gpt-5.4-nano')}")
+    print(f"Modo prompt: {os.environ.get('MCA_PROMPT_MODE', 'minimal')}")
+    print("API key: " + ("configurada" if os.environ.get("OPENAI_API_KEY") else "faltante en .env"))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

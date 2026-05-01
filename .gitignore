@@ -1,0 +1,10 @@
+.env
+api-keys.env
+memory.sqlite3
+memory.sqlite3-*
+*.log
+*.pid
+__pycache__/
+*.py[cod]
+.venv/
+venv/
