@@ -39,14 +39,16 @@ PROXY_SHARED_TOKEN=pon_un_token_largo_random
 MCA_MEMORY_DB=memory.sqlite3
 MCA_PROMPT_MODE=minimal
 MCA_CONTEXT_MESSAGES=2
-MCA_MAX_INPUT_CHARS=700
-MCA_MAX_SYSTEM_CHARS=2800
+MCA_MAX_INPUT_CHARS=900
+MCA_MAX_SYSTEM_MESSAGE_CHARS=12000
+MCA_MAX_SYSTEM_CHARS=6000
 MCA_MAX_MEMORY_FACTS=4
 MCA_MAX_PLAYER_FACTS=3
 MCA_PLAYER_FACT_LIMIT=24
 MCA_SHARED_PLAYER_MEMORY=false
 MCA_ALLOW_NAME_FALLBACK_MEMORY=false
 MCA_STORE_RAW_TURNS=false
+MCA_INSTRUCTIONS_MAX_CHARS=5200
 MCA_DIRECT_COMMANDS_LOCAL=true
 MCA_DIRECT_COMMAND_MAX_CHARS=90
 MCA_FAMILY_CONTEXT=true
@@ -109,11 +111,23 @@ Si abres solo `https://TU-DOMINIO-O-IP/`, tambien debe responder `ok: true`
 y mostrar las rutas disponibles. El endpoint que debes poner en MCA Reborn es
 siempre `/v1/chat/completions`, no solo el dominio.
 
+Para confirmar que Render ya desplego la version que preserva la ficha completa
+de MCA, `/health` debe incluir:
+
+```json
+"code_version": "mca-context-preserve-20260501"
+```
+
+Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
+
 ## Importante
 
 - No subas `.env`, `api-keys.env`, `memory.sqlite3`, logs ni crash reports.
 - No dejes `PROXY_SHARED_TOKEN` vacio si el endpoint sera publico.
 - No pegues la API key en `config/mca.json`.
+- Mantener `MCA_MAX_SYSTEM_MESSAGE_CHARS`, `MCA_MAX_SYSTEM_CHARS` y
+  `MCA_INSTRUCTIONS_MAX_CHARS` altos ayuda a que el proxy no pierda oficio,
+  rasgos, personalidad, estado de animo ni relaciones enviados por MCA.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,

@@ -21,7 +21,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "self-vocative-20260501"
+CODE_VERSION = "mca-context-preserve-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -84,6 +84,46 @@ PROFESSION_DETAILS = {
         "label": "herrero de armas",
         "activities": "espadas, hachas, filo, defensa y amenazas",
     },
+    "blacksmith": {
+        "label": "herrero",
+        "activities": "forja, yunques, metal, reparar herramientas, mantener armas y reforzar equipo",
+    },
+    "miner": {
+        "label": "minero",
+        "activities": "picos, vetas, piedra, tuneles, minerales y seguridad bajo tierra",
+    },
+    "baker": {
+        "label": "panadero",
+        "activities": "pan, hornos, masa, trigo, dulces y comida para la aldea",
+    },
+    "guard": {
+        "label": "guardia",
+        "activities": "patrullas, antorchas, amenazas, proteger vecinos y vigilar entradas",
+    },
+    "warrior": {
+        "label": "guerrero",
+        "activities": "combate, entrenamiento, proteger aliados y enfrentar peligros",
+    },
+    "archer": {
+        "label": "arquero",
+        "activities": "arcos, flechas, vigilancia, distancia y defender la aldea",
+    },
+    "adventurer": {
+        "label": "aventurero",
+        "activities": "viajes, ruinas, mapas, encargos, peligros y descubrimientos",
+    },
+    "mercenary": {
+        "label": "mercenario",
+        "activities": "contratos, escoltas, combate por paga y proteger a quien lo merece",
+    },
+    "outlaw": {
+        "label": "forajido",
+        "activities": "problemas, escondites, favores dudosos y evitar autoridades",
+    },
+    "cultist": {
+        "label": "cultista",
+        "activities": "rituales, secretos, rumores oscuros y lealtades peligrosas",
+    },
     "nitwit": {
         "label": "aldeano sin oficio fijo",
         "activities": "recados, chismes, paseos y excusas para evitar trabajo estable",
@@ -94,6 +134,7 @@ PROFESSION_ALIASES = {
     "armorer": "armorer",
     "armourer": "armorer",
     "armero": "armorer",
+    "armorsmith": "armorer",
     "butcher": "butcher",
     "carnicero": "butcher",
     "cartographer": "cartographer",
@@ -124,8 +165,44 @@ PROFESSION_ALIASES = {
     "weaponsmith": "weaponsmith",
     "herrero de armas": "weaponsmith",
     "herrero_de_armas": "weaponsmith",
+    "blacksmith": "blacksmith",
+    "smith": "blacksmith",
+    "herrero": "blacksmith",
+    "herrera": "blacksmith",
+    "forjador": "blacksmith",
+    "forjadora": "blacksmith",
+    "miner": "miner",
+    "minero": "miner",
+    "minera": "miner",
+    "baker": "baker",
+    "panadero": "baker",
+    "panadera": "baker",
+    "guard": "guard",
+    "guardia": "guard",
+    "warrior": "warrior",
+    "guerrero": "warrior",
+    "guerrera": "warrior",
+    "archer": "archer",
+    "arquero": "archer",
+    "arquera": "archer",
+    "adventurer": "adventurer",
+    "aventurero": "adventurer",
+    "aventurera": "adventurer",
+    "mercenary": "mercenary",
+    "mercenario": "mercenary",
+    "mercenaria": "mercenary",
+    "outlaw": "outlaw",
+    "forajido": "outlaw",
+    "forajida": "outlaw",
+    "cultist": "cultist",
+    "cultista": "cultist",
     "nitwit": "nitwit",
+    "jobless": "nitwit",
+    "unemployed": "nitwit",
+    "desempleado": "nitwit",
+    "sin oficio": "nitwit",
 }
+PROFESSION_PREFIX_PATTERN = r"(?:minecraft:|profession[._:-]|mca[._:-]profession[._:-])?"
 MINIMAL_PROMPT = (
     "Eres un aldeano de rol de MCA, vivo y conversador. "
     "Responde en espanol natural, 1-2 frases, siempre en primera persona como dialogo directo entre ustedes; no narres sobre ti en tercera persona. "
@@ -1184,7 +1261,45 @@ def compact_text(value: str, limit: int) -> str:
     text = re.sub(r"\s+", " ", value or "").strip()
     if len(text) <= limit:
         return text
-    return text[: limit - 1].rstrip() + "..."
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3].rstrip() + "..."
+
+
+def salient_system_context(system_text: str, limit: int) -> str:
+    raw = re.sub(r"\s+", " ", system_text or "").strip()
+    if not raw:
+        return ""
+
+    important: list[str] = []
+    tag_text = " ".join(re.findall(r"\[(?:world_id|player_id|character_id):[^\]]+\]", raw))
+    if tag_text:
+        important.append(tag_text)
+
+    sentence_patterns = [
+        r"\bconversation with\b",
+        r"\bvillager named\b",
+        r"\bPlayer named\b",
+        r"\b(?:is|has|hates|dislikes|likes|knows|married|engaged|parent)\b",
+        r"\b(?:profession|job|occupation|oficio|trabajo|trait|mood|personality|hearts)\b",
+        r"\b(?:raining|night|thundering|hurt|injured|sick|infected|pregnant)\b",
+    ]
+    profession_aliases = sorted(PROFESSION_ALIASES, key=len, reverse=True)
+    for sentence in re.split(r"(?<=[.!?])\s+", raw):
+        clean = compact_text(sentence, 260)
+        if not clean:
+            continue
+        text = normalize_for_match(clean)
+        if any(re.search(pattern, text) for pattern in sentence_patterns):
+            important.append(clean)
+            continue
+        if any(re.search(rf"\b{re.escape(alias)}\b", text) for alias in profession_aliases):
+            important.append(clean)
+    deduped = list(dict.fromkeys(important))
+    if not deduped:
+        return compact_text(raw, limit)
+    combined = "Contexto MCA esencial preservado: " + " ".join(deduped) + "\n\nContexto MCA completo recortado: " + raw
+    return compact_text(combined, limit)
 
 
 def normalize_for_match(value: str) -> str:
@@ -1234,10 +1349,11 @@ def extract_current_profession(system_text: str) -> str:
         return ""
 
     alias_pattern = "|".join(re.escape(alias) for alias in sorted(PROFESSION_ALIASES, key=len, reverse=True))
+    profession_ref = rf"{PROFESSION_PREFIX_PATTERN}({alias_pattern})"
     explicit_patterns = [
-        rf"\b(?:profession|job|occupation|career|work|oficio|trabajo|profesion)\s*(?:is|=|:|-)?\s*(?:minecraft:)?({alias_pattern})\b",
-        rf"\b(?:is|as|soy|es|como)\s+(?:a|an|un|una)?\s*(?:minecraft:)?({alias_pattern})\b",
-        rf"\bminecraft:({alias_pattern})\b",
+        rf"\b(?:profession|job|occupation|career|work|oficio|trabajo|profesion)\s*(?:is|=|:|-)?\s*{profession_ref}\b",
+        rf"\b(?:is|as|soy|es|como)\s+(?:a|an|un|una)?\s*{profession_ref}\b",
+        rf"\b(?:minecraft:|profession[._:-]|mca[._:-]profession[._:-])({alias_pattern})\b",
     ]
     for pattern in explicit_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -1503,10 +1619,16 @@ def split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
     last_user = ""
     villager_name = ""
     player_name = ""
+    system_message_limit = max(env_int("MCA_MAX_SYSTEM_MESSAGE_CHARS", 12000), 12000)
+    system_context_limit = max(env_int("MCA_MAX_SYSTEM_CHARS", 6000), 6000)
 
     for message in messages:
         role = str(message.get("role", "user")).lower()
-        text = compact_text(content_to_text(message.get("content")), env_int("MCA_MAX_INPUT_CHARS", 700))
+        raw_text = content_to_text(message.get("content"))
+        if role in {"system", "developer"}:
+            text = compact_text(raw_text, system_message_limit)
+        else:
+            text = compact_text(raw_text, env_int("MCA_MAX_INPUT_CHARS", 700))
         if not text:
             continue
         name = str(message.get("name") or "").strip()
@@ -1525,7 +1647,7 @@ def split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
     keep_messages = env_int("MCA_CONTEXT_MESSAGES", 1)
     if keep_messages >= 0:
         conversation = conversation[-keep_messages:] if keep_messages else []
-    system_text = compact_text("\n".join(system_parts), env_int("MCA_MAX_SYSTEM_CHARS", 2800))
+    system_text = salient_system_context("\n".join(system_parts), system_context_limit)
     return system_text, conversation, last_user, villager_name, player_name
 
 
@@ -1730,6 +1852,24 @@ def trait_mood_guidance(system_text: str) -> str:
         hints.append("valiente: protege antes de quejarse y acepta peligro con firmeza.")
     if re.search(r"\b(coward|cobarde|fearful)\b", text):
         hints.append("miedoso: duda ante monstruos, pide apoyo o prefiere refugio.")
+    trait_hints = [
+        (r"\b(lactose[ _-]?intolerance|intoleran\w*\s+a\s+la\s+lactosa)\b", "intolerancia a lactosa: evita leche, queso o bromas de comida lactea como si fueran mala idea."),
+        (r"\b(coeliac|celiac|coeliac[ _-]?disease|celiac[ _-]?disease|gluten|celiac[oa])\b", "celiaquia/gluten: cuida lo que come y evita pan o trigo si el tema sale."),
+        (r"\b(diabetes|diabetic[oa]?)\b", "diabetes: habla con cuidado de azucar, cansancio o cuidados de salud sin dramatizar."),
+        (r"\b(dwarfism|dwarf|enanism|enan[oa])\b", "enanismo: reconoce su estatura como rasgo propio si importa; no lo conviertas en chiste."),
+        (r"\b(albinism|albino|albina|albinismo)\b", "albinismo: piel/cabello claros y sensibilidad al sol si encaja con la escena."),
+        (r"\b(heterochromia|heterocromia)\b", "heterocromia: tiene ojos de distinto color; puede mencionarlo si hablan de apariencia."),
+        (r"\b(left[ _-]?handed|zurdo|zurda)\b", "zurdo: usa la mano izquierda como costumbre propia en gestos o trabajo."),
+        (r"\b(electrified|electrico|electrica|electrizad[oa])\b", "electrificado: personalidad o cuerpo con energia inquieta; evita tocarlo como si fuera normal si el rasgo es literal."),
+        (r"\b(tough|resilient|duro|dura|resistente)\b", "resistente: soporta dolor, trabajo duro o peligro con mas firmeza."),
+        (r"\b(weak|debil|fragil)\b", "debil/fragil: evita esfuerzos grandes y pide apoyo antes de exponerse."),
+        (r"\b(vegetarian|vegetarian[oa])\b", "vegetariano: evita carne y puede hablar de comida vegetal o animales con mas cuidado."),
+    ]
+    for pattern, hint in trait_hints:
+        if re.search(pattern, text):
+            hints.append(hint)
+            if len(hints) >= 6:
+                break
     if re.search(r"\b(homosexual|gay|lesbian|lesbiana)\b", text):
         hints.append("orientacion homosexual: su atraccion romantica va hacia su mismo genero; expresalo con naturalidad si el romance sale.")
     elif re.search(r"\b(bisexual|biromantic|bisexual)\b", text):
@@ -1922,7 +2062,7 @@ def build_instructions(
     if facts:
         parts.append("Memoria esencial:\n" + "\n".join(f"- {fact}" for fact in facts))
     instructions = "\n\n".join(part for part in parts if part.strip())
-    return compact_text(instructions, env_int("MCA_INSTRUCTIONS_MAX_CHARS", 3600))
+    return compact_text(instructions, max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200))
 
 
 def call_openai_responses(
@@ -2274,6 +2414,9 @@ class Handler(BaseHTTPRequestHandler):
                     "max_output_tokens": env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
                     "reasoning_effort": os.environ.get("OPENAI_REASONING_EFFORT", ""),
                     "text_verbosity": os.environ.get("OPENAI_TEXT_VERBOSITY", ""),
+                    "max_system_message_chars": max(env_int("MCA_MAX_SYSTEM_MESSAGE_CHARS", 12000), 12000),
+                    "max_system_chars": max(env_int("MCA_MAX_SYSTEM_CHARS", 6000), 6000),
+                    "instructions_max_chars": max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200),
                     "family_entries": self.server.family.entry_count(),
                     "village_count": self.server.village.village_count(),
                     "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
