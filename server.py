@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "redis-memory-personality-20260501"
+CODE_VERSION = "npc-full-identity-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -1130,7 +1130,7 @@ def uuid_from_int_array(value: Any) -> str | None:
 
 class FamilyTreeCache:
     RELATIONSHIP_STATES = {
-        0: "soltero/a",
+        0: "sin pareja registrada",
         1: "enamorado/a o prometido/a",
         2: "comprometido/a",
         3: "casado/a con aldeano",
@@ -1207,8 +1207,25 @@ class FamilyTreeCache:
         self.refresh()
         return len(self.entries)
 
+    def gender_label(self, node: dict[str, Any]) -> str:
+        if node.get("player"):
+            return "jugador masculino"
+        gender = self.effective_gender(node)
+        if gender == 1:
+            return "hombre"
+        if gender == 2:
+            return "mujer"
+        return self.GENDERS.get(gender, "genero no especificado")
+
     def life_status(self, node: dict[str, Any]) -> str:
-        return "fallecido/a" if node.get("deceased") else "vivo/a"
+        gender = self.effective_gender(node)
+        if node.get("deceased"):
+            if gender == 2:
+                return "fallecida"
+            return "fallecido"
+        if gender == 2:
+            return "viva"
+        return "vivo"
 
     def display_name(self, entry_id: str | None, include_life: bool = False) -> str:
         if not entry_id:
@@ -1296,6 +1313,8 @@ class FamilyTreeCache:
         return f"pareja {name}"
 
     def effective_gender(self, node: dict[str, Any]) -> int:
+        if node.get("player"):
+            return 1
         gender = int(node.get("gender") or 0)
         if gender:
             return gender
@@ -1419,7 +1438,7 @@ class FamilyTreeCache:
         facts: list[str] = []
         name = node["name"]
         state = self.RELATIONSHIP_STATES.get(node["relationship"], "estado civil desconocido")
-        facts.append(f"{name}: {state}.")
+        facts.append(f"{name}: {self.gender_label(node)}, {self.life_status(node)}, {state}.")
 
         partner_names = [
             self.labeled_partner_name(partner_id) for partner_id in self.partner_ids_for(node)
@@ -1427,6 +1446,8 @@ class FamilyTreeCache:
         partner_names = [partner for partner in partner_names if partner]
         if partner_names:
             facts.append("Pareja/conyuge: " + ", ".join(partner_names[:2]) + ".")
+        else:
+            facts.append("Pareja/conyuge: no registrada en el arbol.")
 
         parents = [
             self.labeled_parent_name(parent_id) for parent_id in self.parent_ids_for(node)
@@ -1453,6 +1474,8 @@ class FamilyTreeCache:
         child_names = [child for child in child_names if child]
         if child_names:
             facts.append("Hijos/as: " + ", ".join(child_names[:4]) + ".")
+        else:
+            facts.append("Hijos/as: no hay registrados en el arbol.")
 
         sibling_names = [
             self.display_name(sibling_id, include_life=True) for sibling_id in self.sibling_ids(node, 3)
@@ -1464,7 +1487,7 @@ class FamilyTreeCache:
         if node["deceased"]:
             facts.append("Esta persona figura como fallecida en el arbol familiar.")
 
-        max_facts = env_int("MCA_FAMILY_MAX_FACTS", 6)
+        max_facts = max(env_int("MCA_FAMILY_MAX_FACTS", 8), 8)
         return label + ": " + " ".join(facts[:max_facts])
 
 
@@ -1574,9 +1597,11 @@ def salient_system_context(system_text: str, limit: int) -> str:
         r"\bconversation with\b",
         r"\bvillager named\b",
         r"\bPlayer named\b",
-        r"\b(?:is|has|hates|dislikes|likes|knows|married|engaged|parent)\b",
-        r"\b(?:profession|job|occupation|oficio|trabajo|trait|mood|personality|hearts)\b",
-        r"\b(?:raining|night|thundering|hurt|injured|sick|infected|pregnant)\b",
+        r"\b(?:is|has|hates|dislikes|likes|knows|married|engaged|parent|spouse|child|children|father|mother)\b",
+        r"\b(?:profession|job|occupation|oficio|trabajo|trait|mood|personality|hearts|gender|male|female)\b",
+        r"\b(?:orientation|sexuality|homosexual|bisexual|asexual|heterosexual|gay|lesbian|straight)\b",
+        r"\b(?:disease|condition|illness|sick|infected|diabetes|coeliac|celiac|lactose|albinism|heterochromia|dwarfism)\b",
+        r"\b(?:raining|night|thundering|hurt|injured|pregnant)\b",
     ]
     profession_aliases = sorted(PROFESSION_ALIASES, key=len, reverse=True)
     for sentence in re.split(r"(?<=[.!?])\s+", raw):
@@ -1683,6 +1708,53 @@ def detect_age_state(system_text: str) -> str:
     return "adulto/no infantil si MCA no indica lo contrario"
 
 
+def detect_gender_state(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    if re.search(r"\b(?:female|woman|girl|mujer|femenin[oa]|aldeana)\b", text):
+        return "mujer/femenino"
+    if re.search(r"\b(?:male|man|boy|hombre|masculin[oa]|aldeano)\b", text):
+        return "hombre/masculino"
+    return "no especificado por MCA"
+
+
+def gender_identity_guidance(system_text: str) -> str:
+    gender = detect_gender_state(system_text)
+    if gender == "no especificado por MCA":
+        return (
+            "Genero del NPC actual: MCA no envio genero claro. No inventes genero si el jugador pregunta; "
+            "si debes hablar de ti, usa frases neutras o tu nombre."
+        )
+    return (
+        f"Genero del NPC actual: {gender}. Habla de ti con pronombres y adjetivos coherentes con ese genero. "
+        "No cambies tu genero por el genero del jugador, por recuerdos viejos ni por el oficio."
+    )
+
+
+def vital_trait_summary(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    items: list[str] = []
+    checks = [
+        (r"\b(lactose[ _-]?intolerance|intoleran\w*\s+a\s+la\s+lactosa)\b", "intolerancia a lactosa"),
+        (r"\b(coeliac|celiac|coeliac[ _-]?disease|celiac[ _-]?disease|gluten|celiac[oa])\b", "celiaquia/gluten"),
+        (r"\b(diabetes|diabetic[oa]?)\b", "diabetes"),
+        (r"\b(dwarfism|dwarf|enanism|enan[oa])\b", "enanismo"),
+        (r"\b(albinism|albino|albina|albinismo)\b", "albinismo"),
+        (r"\b(heterochromia|heterocromia)\b", "heterocromia"),
+        (r"\b(left[ _-]?handed|zurdo|zurda)\b", "zurdo/a"),
+        (r"\b(vegetarian|vegetarian[oa])\b", "vegetarianismo"),
+        (r"\b(homosexual|gay|lesbian|lesbiana)\b", "orientacion homosexual"),
+        (r"\b(bisexual|biromantic)\b", "orientacion bisexual"),
+        (r"\b(asexual|aromantic|arromantic[oa])\b", "orientacion asexual/arromantica"),
+        (r"\b(heterosexual|straight)\b", "orientacion heterosexual"),
+    ]
+    for pattern, label in checks:
+        if re.search(pattern, text):
+            items.append(label)
+    if not items:
+        return ""
+    return "Datos vitales/rasgos detectados: " + ", ".join(dict.fromkeys(items)) + "."
+
+
 def self_awareness_context(
     system_text: str,
     villager_name: str,
@@ -1696,7 +1768,7 @@ def self_awareness_context(
     if villager_name:
         parts.append(f"Nombre propio actual: {villager_name}; no lo repitas como muletilla.")
     if player_name:
-        parts.append(f"Jugador actual: {player_name}.")
+        parts.append(f"Jugador actual: {player_name}; tratalo como personaje masculino.")
     if ids.get("character_id") and ids["character_id"] != "unknown_character":
         parts.append(f"ID unico del aldeano: {ids['character_id']}. Usa sus recuerdos como propios, no como recuerdos de otros NPC.")
     else:
@@ -1706,7 +1778,11 @@ def self_awareness_context(
         parts.append(f"Oficio actual: {details['label']} ({details['activities']}).")
     else:
         parts.append("Oficio actual: no confirmado por MCA; no inventes oficio si te preguntan.")
+    parts.append(gender_identity_guidance(system_text))
     parts.append(f"Edad/etapa detectada: {detect_age_state(system_text)}.")
+    vital_traits = vital_trait_summary(system_text)
+    if vital_traits:
+        parts.append(vital_traits)
     parts.append(
         "La personalidad, estado de animo, rasgos, relacion y entorno actuales vienen del contexto de MCA; obedecelos antes que cualquier recuerdo."
     )
@@ -1728,13 +1804,22 @@ def current_mca_state_lines(system_text: str, villager_name: str) -> list[str]:
         text = normalize_for_match(sentence)
         if sentence.startswith("["):
             continue
+        important_state = bool(
+            re.search(
+                r"\b(gender|male|female|profession|personality|mood|trait|hearts?|orientation|sexuality|"
+                r"homosexual|bisexual|asexual|heterosexual|disease|condition|lactose|diabetes|coeliac|celiac|"
+                r"spouse|married|engaged|children|child|father|mother|parent)\b",
+                text,
+            )
+        )
         if (
             (normalized_name and normalized_name in text)
             or text.startswith("it is ")
             or "$villager" in text
+            or important_state
         ):
             lines.append(sentence)
-        if len(lines) >= 8:
+        if len(lines) >= 12:
             break
     return lines
 
@@ -1862,6 +1947,8 @@ def request_debug_snapshot(
         "player_id": ids.get("player_id", ""),
         "character_id": ids.get("character_id", ""),
         "profession": profession or "",
+        "gender": detect_gender_state(system_text),
+        "vital_traits": vital_trait_summary(system_text),
         "age_state": detect_age_state(system_text),
         "has_real_character_id": ids.get("character_id") != "unknown_character",
         "last_user_excerpt": compact_text(last_user, 120),
@@ -1968,11 +2055,12 @@ def sanitize_system_text(system_text: str) -> str:
 
 
 def player_name_rule(player_name: str) -> str:
+    masculine_rule = "Todos los players/jugadores son personajes masculinos: el jugador actual es jugador masculino; usa el jugador, el, esposo, padre o hijo cuando corresponda; no los trates en femenino aunque el arbol no traiga genero."
     if player_name.lower() == "chanchowapo":
-        return "El jugador se llama Chanchowapo; puedes usar Mondongo solo si el contexto lo amerita o el jugador lo pide. No digas su nombre/apodo como muletilla. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
+        return masculine_rule + " El jugador se llama Chanchowapo; puedes usar Mondongo solo si el contexto lo amerita o el jugador lo pide. No digas su nombre/apodo como muletilla. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
     if player_name:
-        return f"El jugador se llama {player_name}. No digas su nombre como muletilla y no lo llames Mondongo. Usa su nombre solo si el jugador lo pide, si corriges identidad/familia/lore o si es necesario para evitar confusion. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
-    return "No llames Mondongo al jugador salvo si su nombre exacto es Chanchowapo. No digas el nombre del jugador como muletilla. Usa los nombres familiares exactos del arbol."
+        return masculine_rule + f" El jugador se llama {player_name}. No digas su nombre como muletilla y no lo llames Mondongo. Usa su nombre solo si el jugador lo pide, si corriges identidad/familia/lore o si es necesario para evitar confusion. Usa los nombres familiares exactos del arbol; no pongas el nombre del jugador a sus hijos."
+    return masculine_rule + " No llames Mondongo al jugador salvo si su nombre exacto es Chanchowapo. No digas el nombre del jugador como muletilla. Usa los nombres familiares exactos del arbol."
 
 
 def extract_mca_commands(system_text: str) -> dict[str, str]:
@@ -2226,7 +2314,7 @@ def relationship_roleplay_guidance(family_context: str, system_text: str, player
 def relationship_score_from_system(system_text: str) -> int | None:
     text = normalize_for_match(system_text)
     patterns = [
-        r"\b(-?\d+)\s*(?:hearts?|corazones?)\b",
+        r"(?<!\w)(-?\d+)\s*(?:hearts?|corazones?)\b",
         r"\b(?:hearts?|corazones?)\s*(?:is|=|:)?\s*(-?\d+)\b",
     ]
     for pattern in patterns:
@@ -2262,16 +2350,33 @@ def relationship_temperature_guidance(system_text: str) -> str:
 
 def response_focus_context(last_user: str, system_text: str) -> str:
     text = normalize_for_match(last_user)
+    focus_parts: list[str] = []
     if re.search(r"\b(personalidad|caracter|como\s+eres|que\s+tipo\s+de\s+persona|rasgos?)\b", text):
         relation = relationship_temperature_guidance(system_text)
-        return (
+        focus_parts.append(
             "Enfoque de respuesta: el jugador pregunta por tu personalidad o caracter. "
             "Responde desde tu personalidad, estado de animo, rasgos y relacion actual; el oficio solo puede ser un detalle secundario. "
             "Si MCA indica flirty/coqueta/coqueto, debe sentirse en el tono: jugueton, directo y con encanto. "
             "Si la relacion es baja o negativa, ese coqueteo debe sonar distante, mordaz o provocador, no entregado ni romantico. "
             + relation
-        ).strip()
-    return ""
+        )
+    if re.search(r"\b(genero|hombre|mujer|masculino|femenino|eres\s+chico|eres\s+chica)\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por tu genero. Responde con el genero actual detectado por MCA; no respondas desde tu oficio."
+        )
+    if re.search(r"\b(orientacion|sexualidad|gay|lesbiana|bisexual|asexual|heterosexual|te\s+gustan|atraen)\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por orientacion romantica/sexual. Usa solo la orientacion detectada por MCA si existe; si no existe, di que no lo tienes claro sin inventar."
+        )
+    if re.search(r"\b(enfermedad|padecimiento|condicion|condicion|salud|diabetes|lactosa|gluten|celiac|celiaquia|rasgo)\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por padecimientos, condiciones o rasgos. Usa los rasgos detectados en MCA; no los conviertas en oficio ni los ignores."
+        )
+    if re.search(r"\b(familia|arbol|genealogic|hij[oa]s?|espos[ao]|pareja|padre|madre|herman[oa]|abuel[oa])\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por familia. Usa el arbol genealogico cargado, distingue vivos/fallecidos y corrige con naturalidad si el jugador inventa parentescos. Si no hay datos familiares cargados en el contexto, no inventes hijos, padres ni pareja."
+        )
+    return " ".join(part.strip() for part in focus_parts if part.strip())
 
 
 def memory_question_context(last_user: str) -> str:
@@ -2794,6 +2899,8 @@ class Handler(BaseHTTPRequestHandler):
                     "max_system_chars": max(env_int("MCA_MAX_SYSTEM_CHARS", 6000), 6000),
                     "instructions_max_chars": max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200),
                     "family_entries": self.server.family.entry_count(),
+                    "family_data_loaded": self.server.family.entry_count() > 0,
+                    "world_data_dir": str(getattr(self.server, "world_data_dir", "")),
                     "village_count": self.server.village.village_count(),
                     "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
                     "shared_player_memory": env_bool("MCA_SHARED_PLAYER_MEMORY", False),
@@ -3015,6 +3122,7 @@ class Server(ThreadingHTTPServer):
     memory: MemoryStore
     family: FamilyTreeCache
     village: VillageCache
+    world_data_dir: Path
     recent_debug: deque[dict[str, Any]]
 
 
@@ -3030,6 +3138,7 @@ def main() -> None:
     server.memory = create_memory_store(db_path)
     server.family = FamilyTreeCache(data_dir)
     server.village = VillageCache(data_dir)
+    server.world_data_dir = data_dir
     server.recent_debug = deque(maxlen=RECENT_DEBUG_LIMIT)
     print(f"MCA roleplay proxy escuchando en http://{host}:{port}/v1/chat/completions")
     print(f"Modelo configurado: {os.environ.get('OPENAI_MODEL', 'gpt-5.4-nano')}")

@@ -124,7 +124,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "redis-memory-personality-20260501"
+"code_version": "npc-full-identity-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -142,6 +142,9 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - Con `MCA_MEMORY_BACKEND=redis`, los recuerdos se guardan por
   `world_id + player_id + character_id`; un chiste o charla con un aldeano no
   se mezcla con otro aldeano.
+- El proxy fuerza a todos los jugadores como personajes masculinos y respeta el
+  genero del NPC, su orientacion, padecimientos, hijos, pareja, padres y estado
+  vivo/fallecido cuando MCA o el arbol genealogico lo envian.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,
