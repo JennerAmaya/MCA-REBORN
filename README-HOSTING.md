@@ -101,6 +101,10 @@ https://TU-DOMINIO-O-IP/health
 
 Debe responder JSON con `ok: true`.
 
+Si abres solo `https://TU-DOMINIO-O-IP/`, tambien debe responder `ok: true`
+y mostrar las rutas disponibles. El endpoint que debes poner en MCA Reborn es
+siempre `/v1/chat/completions`, no solo el dominio.
+
 ## Importante
 
 - No subas `.env`, `api-keys.env`, `memory.sqlite3`, logs ni crash reports.

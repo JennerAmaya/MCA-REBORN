@@ -1853,6 +1853,16 @@ class Handler(BaseHTTPRequestHandler):
         return token == expected
 
     def do_GET(self) -> None:
+        if self.path in ("", "/"):
+            self.send_json(
+                {
+                    "ok": True,
+                    "service": "mca-roleplay-proxy",
+                    "health": "/health",
+                    "chat_completions": "/v1/chat/completions",
+                }
+            )
+            return
         if self.path == "/health":
             self.send_json(
                 {
