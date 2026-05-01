@@ -124,7 +124,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "npc-full-identity-20260501"
+"code_version": "relationship-command-memory-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -145,6 +145,9 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - El proxy fuerza a todos los jugadores como personajes masculinos y respeta el
   genero del NPC, su orientacion, padecimientos, hijos, pareja, padres y estado
   vivo/fallecido cuando MCA o el arbol genealogico lo envian.
+- Los comandos mecanicos solo se ejecutan con orden directa. Una conversacion
+  normal no debe devolver `follow-player`; para seguir debe existir una frase
+  explicita como `sigueme`, `ven conmigo` o `acompaname`.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,

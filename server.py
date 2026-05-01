@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "npc-full-identity-20260501"
+CODE_VERSION = "relationship-command-memory-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -268,6 +268,11 @@ def env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def raw_turn_memory_enabled() -> bool:
+    default = os.environ.get("MCA_MEMORY_BACKEND", "").strip().lower() == "redis"
+    return env_bool("MCA_STORE_RAW_TURNS", default)
 
 
 def redis_key_part(value: str) -> str:
@@ -519,7 +524,7 @@ class MemoryStore:
             db.close()
 
     def add_turn(self, ids: dict[str, str], role: str, content: str) -> None:
-        if not env_bool("MCA_STORE_RAW_TURNS", False):
+        if not raw_turn_memory_enabled():
             return
         content = compact_text(content, 700)
         if not content:
@@ -542,7 +547,7 @@ class MemoryStore:
             self.prune_turns(db, ids, env_int("MCA_RAW_TURN_LIMIT", 12))
 
     def recent_turns(self, ids: dict[str, str], limit: int) -> list[tuple[str, str]]:
-        if limit <= 0 or not env_bool("MCA_STORE_RAW_TURNS", False):
+        if limit <= 0 or not raw_turn_memory_enabled():
             return []
         with self.connect() as db:
             rows = db.execute(
@@ -791,7 +796,7 @@ class RedisMemoryStore:
         return max(weight, 0) * 10_000_000_000 + updated_at
 
     def add_turn(self, ids: dict[str, str], role: str, content: str) -> None:
-        if not env_bool("MCA_STORE_RAW_TURNS", False) or not self._has_personal_ids(ids):
+        if not raw_turn_memory_enabled() or not self._has_personal_ids(ids):
             return
         content = compact_text(content, env_int("MCA_RAW_TURN_MAX_CHARS", 700))
         if not content:
@@ -811,7 +816,7 @@ class RedisMemoryStore:
             print(f"[memory redis] add_turn failed: {exc}")
 
     def recent_turns(self, ids: dict[str, str], limit: int) -> list[tuple[str, str]]:
-        if limit <= 0 or not env_bool("MCA_STORE_RAW_TURNS", False) or not self._has_personal_ids(ids):
+        if limit <= 0 or not raw_turn_memory_enabled() or not self._has_personal_ids(ids):
             return []
         key = self._key("turns", *self._personal_parts(ids))
         try:
@@ -1183,6 +1188,22 @@ class FamilyTreeCache:
                 child_id = uuid_from_int_array(child)
             if child_id:
                 children.append(child_id)
+        partners: list[str] = []
+        for key in ("spouse", "partner"):
+            partner_id = uuid_from_int_array(raw_node.get(key))
+            if partner_id and partner_id not in partners:
+                partners.append(partner_id)
+        for key in ("spouses", "partners"):
+            raw_partners = raw_node.get(key, [])
+            if isinstance(raw_partners, list):
+                for raw_partner in raw_partners:
+                    partner_id = None
+                    if isinstance(raw_partner, dict):
+                        partner_id = uuid_from_int_array(raw_partner.get("id") or raw_partner.get("uuid"))
+                    elif isinstance(raw_partner, list):
+                        partner_id = uuid_from_int_array(raw_partner)
+                    if partner_id and partner_id not in partners:
+                        partners.append(partner_id)
         return {
             "id": uuid_from_int_array(raw_node.get("id")) or entry_id,
             "name": str(raw_node.get("name") or "desconocido"),
@@ -1192,7 +1213,8 @@ class FamilyTreeCache:
             "profession": str(raw_node.get("profession") or "").replace("minecraft:", ""),
             "father": uuid_from_int_array(raw_node.get("father")),
             "mother": uuid_from_int_array(raw_node.get("mother")),
-            "partner": uuid_from_int_array(raw_node.get("spouse") or raw_node.get("partner")),
+            "partner": partners[0] if partners else None,
+            "partners": partners,
             "relationship": int(raw_node.get("marriageState") or raw_node.get("relationshipState") or 0),
             "children": children,
         }
@@ -1243,11 +1265,29 @@ class FamilyTreeCache:
     def partner_ids_for(self, node: dict[str, Any]) -> list[str]:
         partners: list[str] = []
         self.add_unique_id(partners, node.get("partner"))
+        for partner_id in node.get("partners", []):
+            self.add_unique_id(partners, partner_id)
         for entry_id, other in self.entries.items():
             if entry_id == node["id"]:
                 continue
             if other.get("partner") == node["id"]:
                 self.add_unique_id(partners, entry_id)
+            if node["id"] in other.get("partners", []):
+                self.add_unique_id(partners, entry_id)
+        if not partners and int(node.get("relationship") or 0) in {3, 4}:
+            for entry_id, other in self.entries.items():
+                if entry_id == node["id"]:
+                    continue
+                if self.shared_child_ids(node.get("id"), entry_id):
+                    self.add_unique_id(partners, entry_id)
+        if not partners and int(node.get("relationship") or 0) == 4:
+            candidates = [
+                entry_id
+                for entry_id, other in self.entries.items()
+                if entry_id != node["id"] and other.get("player") and int(other.get("relationship") or 0) == 4
+            ]
+            if len(candidates) == 1:
+                self.add_unique_id(partners, candidates[0])
         return partners
 
     def parent_ids_for(self, node: dict[str, Any]) -> list[str]:
@@ -1343,7 +1383,13 @@ class FamilyTreeCache:
             return ""
         facts: list[str] = []
         if second["id"] in self.partner_ids_for(first):
-            facts.append(f"{first['name']} y {second['name']} son pareja/conyuges registrados.")
+            second_label = self.labeled_partner_name(second["id"]) or self.display_name(second["id"], include_life=True)
+            facts.append(f"{first['name']} esta casado/a o en pareja con {second_label}.")
+        else:
+            partners = [self.labeled_partner_name(partner_id) for partner_id in self.partner_ids_for(first)]
+            partners = [partner for partner in partners if partner]
+            if partners:
+                facts.append(f"Pareja registrada de {first['name']}: " + ", ".join(partners[:2]) + ".")
         shared_children = [self.display_name(child_id, include_life=True) for child_id in self.shared_child_ids(first_id, second_id)]
         shared_children = [name for name in shared_children if name]
         if shared_children:
@@ -1389,10 +1435,13 @@ class FamilyTreeCache:
             re.search(r"\b(tu\s+hij[oa]s?|tus\s+hij[oa]s?|tu\s+bebe|tus\s+bebes)\b", text)
         )
         mentions_spouse = bool(
-            re.search(r"\b(mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer|mi\s+pareja|tu\s+espos[ao]|tu\s+marid[oa]|tu\s+mujer|tu\s+pareja|somos\s+espos[oa]s?|estamos\s+casad[oa]s?)\b", text)
+            re.search(r"\b(mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer|mi\s+pareja|tu\s+espos[ao]|tu\s+marid[oa]|tu\s+mujer|tu\s+pareja|somos\s+espos[oa]s?|estamos\s+casad[oa]s?|estas\s+casad[oa]|esta\s+casad[oa])\b", text)
         )
         asks_about_spouse = bool(
-            re.search(r"\b(que\s+opinas\s+de\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|como\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|amas\s+a\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja))\b", text)
+            re.search(r"\b(qui[eé]n\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|con\s+qui[eé]n\s+estas\s+casad[oa]|con\s+qui[eé]n\s+esta\s+casad[oa]|que\s+opinas\s+de\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|como\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|amas\s+a\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja))\b", text)
+        )
+        asks_relationship = bool(
+            re.search(r"\b(que\s+relacion\s+(tenemos|tienes\s+conmigo)|que\s+somos|somos\s+algo|me\s+quieres|me\s+odias|te\s+caigo)\b", text)
         )
         mentions_parent = bool(
             re.search(r"\b(tu\s+(madre|mama|padre|papa)|mi\s+(madre|mama|padre|papa))\b", text)
@@ -1400,7 +1449,7 @@ class FamilyTreeCache:
         mentions_memory = bool(
             re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text)
         )
-        if not any([mentions_shared_child, mentions_player_child, mentions_villager_child, mentions_spouse, asks_about_spouse, mentions_parent, mentions_memory]):
+        if not any([mentions_shared_child, mentions_player_child, mentions_villager_child, mentions_spouse, asks_about_spouse, asks_relationship, mentions_parent, mentions_memory]):
             return ""
         summary = self.relationship_summary_between(character_id, player_id)
         node = self.get(character_id)
@@ -1420,10 +1469,12 @@ class FamilyTreeCache:
             summary += " Si el jugador dice 'nuestro hijo', corrigelo con naturalidad porque no consta en el arbol."
         if (mentions_shared_child or mentions_player_child) and player_node:
             summary += f" El jugador actual se llama {player_node['name']}; no confundas ese nombre con el nombre de sus hijos."
-        if asks_about_spouse and "pareja/conyuges" in normalize_for_match(summary):
+        if asks_about_spouse and ("casado/a o en pareja" in normalize_for_match(summary) or "pareja registrada" in normalize_for_match(summary)):
             summary += " Si pregunta por tu esposo/pareja y el jugador es esa persona, responde con alegria en primera persona, por ejemplo reconociendo 'eres tu'."
-        if (mentions_spouse or asks_about_spouse) and "pareja/conyuges" not in normalize_for_match(summary):
+        if (mentions_spouse or asks_about_spouse) and "casado/a o en pareja" not in normalize_for_match(summary) and "pareja registrada" not in normalize_for_match(summary):
             summary += " Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
+        if asks_relationship:
+            summary += " Si pregunta por la relacion entre ustedes, combina este arbol familiar con corazones/relacion actual de MCA y no inventes matrimonio si no consta."
         if mentions_memory:
             summary += " Si pregunta que recuerdas de el, usa memoria esencial, lore y vinculos registrados; si falta memoria, admitelo sin inventar hechos concretos."
         return "Verificacion de la afirmacion familiar del jugador: " + summary
@@ -1755,6 +1806,26 @@ def vital_trait_summary(system_text: str) -> str:
     return "Datos vitales/rasgos detectados: " + ", ".join(dict.fromkeys(items)) + "."
 
 
+def mood_state_summary(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    moods = [
+        (r"\b(happy|joyful|cheerful|alegre|feliz|content[oa])\b", "feliz/alegre"),
+        (r"\b(sad|depressed|gloomy|triste|melancolic[oa])\b", "triste/melancolico"),
+        (r"\b(angry|mad|furious|irate|annoyed|enojad[oa]|furios[oa]|irritad[oa])\b", "enojado/irritado"),
+        (r"\b(anxious|nervous|afraid|scared|nervios[oa]|ansios[oa]|asustad[oa])\b", "ansioso/asustado"),
+        (r"\b(tired|sleepy|exhausted|cansad[oa]|agotad[oa]|somnolient[oa])\b", "cansado"),
+        (r"\b(hurt|injured|sick|herid[oa]|enferm[oa])\b", "herido/enfermo"),
+        (r"\b(flirty|coqueto|coqueta|in love|enamorad[oa])\b", "coqueto/enamorado"),
+        (r"\b(jealous|celos[oa]|celoso|celosa)\b", "celoso"),
+        (r"\b(proud|orgullos[oa])\b", "orgulloso"),
+        (r"\b(shy|timid|timid[oa]|vergonzos[oa])\b", "timido"),
+    ]
+    detected = [label for pattern, label in moods if re.search(pattern, text)]
+    if not detected:
+        return ""
+    return "Estado de animo detectado: " + ", ".join(dict.fromkeys(detected)) + ". Debe notarse en el tono de la respuesta."
+
+
 def self_awareness_context(
     system_text: str,
     villager_name: str,
@@ -1783,6 +1854,9 @@ def self_awareness_context(
     vital_traits = vital_trait_summary(system_text)
     if vital_traits:
         parts.append(vital_traits)
+    mood_state = mood_state_summary(system_text)
+    if mood_state:
+        parts.append(mood_state)
     parts.append(
         "La personalidad, estado de animo, rasgos, relacion y entorno actuales vienen del contexto de MCA; obedecelos antes que cualquier recuerdo."
     )
@@ -2075,7 +2149,7 @@ def detect_requested_command(last_user: str, commands: dict[str, str] | None = N
     text = normalize_for_match(last_user)
     command_source = commands or KNOWN_MCA_COMMANDS
     direct_checks = [
-        ("follow-player", r"\b(sigueme|sigue me|seguime|ven|vente|ven aqui|ven conmigo|acompaname|camina conmigo|follow me)\b"),
+        ("follow-player", r"\b(sigueme|sigue me|seguime|ven conmigo|acompaname|camina conmigo|follow me)\b"),
         ("stay-here", r"\b(quedate|quiet[ao]|estate quiet[ao]|espera|esperame|espera aqui|no te muevas|no camines|stay here|wait here)\b"),
         ("move-freely", r"\b(puedes irte|vete|ya puedes moverte|deja de seguirme|sigue con lo tuyo|move freely|go away)\b"),
         ("wear-armor", r"\b(ponte armadura|equipa armadura|usa armadura|wear armor)\b"),
@@ -2122,7 +2196,7 @@ def is_direct_command(last_user: str, requested_command: str) -> bool:
     if len(text) > env_int("MCA_DIRECT_COMMAND_MAX_CHARS", 90):
         return False
     patterns = {
-        "follow-player": r"\b(sigueme|sigue me|seguime|ven|vente|ven aqui|ven conmigo|acompaname|camina conmigo|follow me)\b",
+        "follow-player": r"\b(sigueme|sigue me|seguime|ven conmigo|acompaname|camina conmigo|follow me)\b",
         "stay-here": r"\b(quedate|quiet[ao]|estate quiet[ao]|espera|esperame|espera aqui|no te muevas|no camines|stay here|wait here)\b",
         "move-freely": r"\b(puedes irte|vete|deja de seguirme|sigue con lo tuyo|move freely|go away)\b",
         "wear-armor": r"\b(ponte armadura|equipa armadura|usa armadura|wear armor)\b",
@@ -2311,6 +2385,24 @@ def relationship_roleplay_guidance(family_context: str, system_text: str, player
     return "Vinculos de rol: " + " ".join(parts)
 
 
+def current_player_relationship_guidance(system_text: str, family_context: str, player_name: str) -> str:
+    parts: list[str] = []
+    relation = relationship_temperature_guidance(system_text)
+    if relation:
+        parts.append(relation)
+    text = normalize_for_match(family_context + " " + system_text)
+    player = normalize_for_match(player_name)
+    if player and ("esposo/pareja " + player) in text:
+        parts.append("El jugador actual figura como esposo/pareja del NPC; reconoce esa cercania si el tema sale.")
+    elif player and "pareja/conyuge: no registrada" in text:
+        parts.append("No hay pareja registrada para este NPC en el arbol; no inventes esposo/esposa.")
+    if "hijos compartidos registrados" in text:
+        parts.append("Hay hijos compartidos registrados; si hablan de familia, trata esos hijos como reales y usa sus nombres.")
+    if not parts:
+        return ""
+    return "Relacion actual con el jugador: " + " ".join(parts)
+
+
 def relationship_score_from_system(system_text: str) -> int | None:
     text = normalize_for_match(system_text)
     patterns = [
@@ -2375,6 +2467,14 @@ def response_focus_context(last_user: str, system_text: str) -> str:
     if re.search(r"\b(familia|arbol|genealogic|hij[oa]s?|espos[ao]|pareja|padre|madre|herman[oa]|abuel[oa])\b", text):
         focus_parts.append(
             "Enfoque de respuesta: el jugador pregunta por familia. Usa el arbol genealogico cargado, distingue vivos/fallecidos y corrige con naturalidad si el jugador inventa parentescos. Si no hay datos familiares cargados en el contexto, no inventes hijos, padres ni pareja."
+        )
+    if re.search(r"\b(animo|estado\s+de\s+animo|feliz|triste|enojad[oa]|cansad[oa]|como\s+te\s+sientes|estas\s+bien)\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por tu estado de animo. Responde desde el animo actual detectado por MCA y deja que afecte tu tono."
+        )
+    if re.search(r"\b(relacion|corazones|confianza|amistad|me\s+quieres|me\s+odias|te\s+caigo|que\s+somos)\b", text):
+        focus_parts.append(
+            "Enfoque de respuesta: el jugador pregunta por la relacion entre ustedes. Usa corazones, confianza, matrimonio/familia y memoria compartida con este mismo aldeano; no inventes una relacion mas cercana de la que exista."
         )
     return " ".join(part.strip() for part in focus_parts if part.strip())
 
@@ -2486,6 +2586,13 @@ def build_instructions(
     parts.append(player_rule)
     if focus_context:
         parts.append(focus_context)
+    if family_context:
+        parts.append(
+            family_context
+            + " Usa estos datos con naturalidad solo cuando encajen; no recites todo el arbol de golpe. "
+            + "Si un familiar esta vivo usa 'es/esta'; usa 'fue/estaba' solo cuando figure como fallecido/a. "
+            + "Si hay pareja/conyuge registrada, no digas que estas soltero/a ni que no sabes con quien estas casado/a."
+        )
     if player_lore:
         parts.append(player_lore)
     if mentioned_lore:
@@ -2503,6 +2610,9 @@ def build_instructions(
     relation_guidance = relationship_roleplay_guidance(family_context, system_text, player_name)
     if relation_guidance:
         parts.append(relation_guidance)
+    player_relation = current_player_relationship_guidance(system_text, family_context, player_name)
+    if player_relation:
+        parts.append(player_relation)
     if memory_context:
         parts.append(memory_context)
     if recent_context:
@@ -2524,12 +2634,6 @@ def build_instructions(
         )
     if claim_context:
         parts.append(claim_context)
-    if family_context:
-        parts.append(
-            family_context
-            + " Usa estos datos con naturalidad solo cuando encajen; no recites todo el arbol de golpe. "
-            + "Si un familiar esta vivo usa 'es/esta'; usa 'fue/estaba' solo cuando figure como fallecido/a."
-        )
     if village_context:
         parts.append(
             village_context
@@ -2835,10 +2939,20 @@ def normalize_mca_response(
         data.get("optionalCommand") or data.get("command") or data.get("optional_command") or ""
     ).strip()
 
-    if requested_command and requested_command in commands and not command and not looks_like_refusal(message):
+    known_commands = commands or KNOWN_MCA_COMMANDS
+    allow_mechanical_command = (
+        bool(requested_command)
+        and requested_command in known_commands
+        and is_direct_command(last_user, requested_command)
+    )
+    if not allow_mechanical_command:
+        command = ""
+    elif command and command != requested_command:
+        command = ""
+
+    if allow_mechanical_command and requested_command and not command and not looks_like_refusal(message):
         command = requested_command
 
-    known_commands = commands or KNOWN_MCA_COMMANDS
     if command and command not in known_commands:
         command = ""
 
@@ -2889,7 +3003,7 @@ class Handler(BaseHTTPRequestHandler):
                     "code_version": CODE_VERSION,
                     "model": os.environ.get("OPENAI_MODEL", "gpt-5-nano"),
                     "prompt_mode": os.environ.get("MCA_PROMPT_MODE", "minimal"),
-                    "raw_turns": env_bool("MCA_STORE_RAW_TURNS", False),
+                    "raw_turns": raw_turn_memory_enabled(),
                     "max_output_tokens": env_int("OPENAI_MAX_OUTPUT_TOKENS", 120),
                     "reasoning_effort": os.environ.get("OPENAI_REASONING_EFFORT", ""),
                     "text_verbosity": os.environ.get("OPENAI_TEXT_VERBOSITY", ""),
