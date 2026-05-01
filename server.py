@@ -27,18 +27,114 @@ KNOWN_MCA_COMMANDS = {
     "try-go-home": "Try to go to your home in the village if possible",
     "open-trade-window": "Open the trade menu when the player is interested in trading, prices or inventory",
 }
+PROFESSION_DETAILS = {
+    "armorer": {
+        "label": "armero",
+        "activities": "armaduras, escudos, yunques, reparar equipo y seguridad de la aldea",
+    },
+    "butcher": {
+        "label": "carnicero",
+        "activities": "comida, ahumadores, carne, provisiones y animales de granja",
+    },
+    "cartographer": {
+        "label": "cartografo",
+        "activities": "mapas, rutas, costas, islas, brujulas y lugares por explorar",
+    },
+    "cleric": {
+        "label": "clerigo",
+        "activities": "pociones, heridas, cuidados, rezos y remedios",
+    },
+    "farmer": {
+        "label": "granjero",
+        "activities": "semillas, cosechas, pan, compost, animales y comida",
+    },
+    "fisherman": {
+        "label": "pescador",
+        "activities": "redes, anzuelos, peces, barcas, cubos y clima para pescar",
+    },
+    "fletcher": {
+        "label": "flechero",
+        "activities": "arcos, flechas, plumas, pedernal y practica de punteria",
+    },
+    "leatherworker": {
+        "label": "curtidor",
+        "activities": "cuero, monturas, calderos y armaduras ligeras",
+    },
+    "librarian": {
+        "label": "bibliotecario",
+        "activities": "libros, estanterias, registros, encantamientos y rumores escritos",
+    },
+    "mason": {
+        "label": "cantero",
+        "activities": "piedra, hornos, ladrillos, muros, caminos y reparaciones",
+    },
+    "shepherd": {
+        "label": "pastor",
+        "activities": "lana, tintes, ovejas, telares y mantas",
+    },
+    "toolsmith": {
+        "label": "herrero de herramientas",
+        "activities": "picos, palas, hachas, herramientas y mantenimiento",
+    },
+    "weaponsmith": {
+        "label": "herrero de armas",
+        "activities": "espadas, hachas, filo, defensa y amenazas",
+    },
+    "nitwit": {
+        "label": "aldeano sin oficio fijo",
+        "activities": "recados, chismes, paseos y excusas para evitar trabajo estable",
+    },
+}
+PROFESSION_ALIASES = {
+    "armor": "armorer",
+    "armorer": "armorer",
+    "armourer": "armorer",
+    "armero": "armorer",
+    "butcher": "butcher",
+    "carnicero": "butcher",
+    "cartographer": "cartographer",
+    "cartografo": "cartographer",
+    "cartógrafo": "cartographer",
+    "cleric": "cleric",
+    "clerigo": "cleric",
+    "clérigo": "cleric",
+    "farmer": "farmer",
+    "granjero": "farmer",
+    "fisherman": "fisherman",
+    "pescador": "fisherman",
+    "fletcher": "fletcher",
+    "flechero": "fletcher",
+    "leatherworker": "leatherworker",
+    "curtidor": "leatherworker",
+    "librarian": "librarian",
+    "bibliotecario": "librarian",
+    "mason": "mason",
+    "stone_mason": "mason",
+    "stonemason": "mason",
+    "cantero": "mason",
+    "shepherd": "shepherd",
+    "pastor": "shepherd",
+    "toolsmith": "toolsmith",
+    "herrero de herramientas": "toolsmith",
+    "herrero_de_herramientas": "toolsmith",
+    "weaponsmith": "weaponsmith",
+    "herrero de armas": "weaponsmith",
+    "herrero_de_armas": "weaponsmith",
+    "nitwit": "nitwit",
+}
 MINIMAL_PROMPT = (
     "Eres un aldeano de rol de MCA, vivo y conversador. "
     "Responde en espanol natural, 1-2 frases, siempre en primera persona como dialogo directo entre ustedes; no narres sobre ti en tercera persona. "
     "No termines siempre con preguntas. "
     "Para continuar una charla, usa reaccion, opinion, recuerdo o una pregunta breve solo cuando encaje. "
-    "No menciones tu propio nombre salvo que el jugador te lo pregunte. "
+    "No menciones tu propio nombre salvo que el jugador te lo pregunte; no saludes repitiendo tu nombre. "
     "No digas el nombre ni apodo del jugador como muletilla; usalo solo si el jugador lo pide, si corriges identidad, familia o lore, o si la frase realmente lo necesita. "
     "No uses emojis, caritas, asteriscos ni formato de accion entre asteriscos. "
     "Sabes que vives en Minecraft, en un mundo de islas, aldeas, bloques, oficios, cuevas y mobs. "
     "El archipielago oceanico es trasfondo: no menciones mar, islas, olas ni tormentas salvo que sea relevante. "
-    "Si el jugador pregunta que haces, responde con una actividad concreta de tu oficio, edad, humor o entorno. "
-    "Puedes proponer microacciones de rol como retirarte a trabajar, afilar piedra, cocinar, patrullar, abrazar o defender a alguien. "
+    "Si el jugador pregunta que haces o a que te dedicas, responde con tu oficio real detectado; si no hay oficio claro, dilo sin inventar. "
+    "No digas que construyes, levantas puentes o haces obras si tu oficio no es cantero o no hay contexto claro de construccion. "
+    "Puedes proponer microacciones de rol coherentes con tu oficio, familia o entorno, como pescar, mapear, cocinar, patrullar, abrazar o defender a alguien. "
     "Si hay noche, lluvia, trueno o peligro en el contexto, reaccionas al entorno; no inventes un monstruo presente como hecho seguro si no aparece en la escena. "
     "Ajusta tono por personalidad, humor, corazones, relacion y ordenes disponibles. "
     "Los rasgos y emociones actuales importan: daltonismo, atletismo, orientacion romantica, miedos, cansancio, enojo, alegria o tristeza deben notarse en tono y detalles, no como lista. "
@@ -160,7 +256,6 @@ def mentioned_lore_context(last_user: str, lore: dict[str, str], current_player_
 
 def generate_npc_identity(world_id: str, character_id: str, villager_name: str, system_text: str) -> str:
     seed = int(hashlib.sha1(f"{world_id}:{character_id}:{villager_name}".encode("utf-8")).hexdigest()[:12], 16)
-    text = normalize_for_match(system_text)
     temperaments = [
         "reservado pero atento",
         "orgulloso y trabajador",
@@ -201,28 +296,12 @@ def generate_npc_identity(world_id: str, character_id: str, villager_name: str, 
         "contar anecdotas breves si gana confianza",
         "hacer comentarios concretos sobre comida, piedra o clima",
     ]
-    profession_notes = [
-        ("mason", "Su oficio lo inclina a hablar de piedra, hornos, muros y reparaciones."),
-        ("fisherman", "Su oficio lo inclina a hablar de redes, peces, barcas y clima."),
-        ("farmer", "Su oficio lo inclina a hablar de semillas, pan, cosechas y animales."),
-        ("librarian", "Su oficio lo inclina a hablar de libros, mapas, rumores y registros."),
-        ("cleric", "Su oficio lo inclina a hablar de heridas, pociones, rezos y cuidados."),
-        ("cartographer", "Su oficio lo inclina a hablar de mapas, rutas, costas e islas."),
-        ("armorer", "Su oficio lo inclina a hablar de armaduras, escudos y seguridad."),
-        ("weaponsmith", "Su oficio lo inclina a hablar de filo, defensa y amenazas."),
-        ("toolsmith", "Su oficio lo inclina a hablar de picos, palas, hachas y mantenimiento."),
-        ("butcher", "Su oficio lo inclina a hablar de comida, provisiones y ahumadores."),
-        ("nitwit", "No tiene oficio fijo; improvisa excusas, paseos y chismes."),
-    ]
-    profession = next((note for key, note in profession_notes if key in text), "")
     identity = (
         f"Rasgo estable: {temperaments[seed % len(temperaments)]}; "
         f"le gustan {likes[(seed // 7) % len(likes)]}; "
         f"le incomoda {dislikes[(seed // 13) % len(dislikes)]}; "
         f"suele {habits[(seed // 19) % len(habits)]}."
     )
-    if profession:
-        identity += " " + profession
     return compact_text(identity, env_int("MCA_NPC_IDENTITY_MAX_CHARS", 260))
 
 
@@ -355,6 +434,8 @@ class MemoryStore:
         return list(reversed(rows))
 
     def add_fact(self, ids: dict[str, str], fact: str, weight: int = 1) -> None:
+        if ids["character_id"] == "unknown_character":
+            return
         fact = compact_text(fact, 220)
         if not fact:
             return
@@ -384,7 +465,7 @@ class MemoryStore:
             self.prune_facts(db, ids, env_int("MCA_FACT_LIMIT", 24))
 
     def essential_facts(self, ids: dict[str, str], limit: int) -> list[str]:
-        if limit <= 0:
+        if limit <= 0 or ids["character_id"] == "unknown_character":
             return []
         with self.connect() as db:
             rows = db.execute(
@@ -1081,6 +1162,80 @@ def normalize_for_match(value: str) -> str:
     return "".join(char for char in normalized if not unicodedata.combining(char))
 
 
+def normalize_identifier_piece(value: str, fallback: str) -> str:
+    normalized = normalize_for_match(value)
+    normalized = re.sub(r"[:/\\]+", "_", normalized)
+    normalized = re.sub(r"[^a-z0-9_ -]+", "", normalized)
+    normalized = re.sub(r"[\s-]+", "_", normalized).strip("_")
+    return normalized or fallback
+
+
+def stable_fallback_id(prefix: str, value: str) -> str:
+    clean = normalize_identifier_piece(value, prefix)
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}:{clean[:48]}:{digest}"
+
+
+def apply_fallback_session_ids(
+    ids: dict[str, str],
+    villager_name: str,
+    player_name: str,
+    system_text: str,
+) -> dict[str, str]:
+    fixed = dict(ids)
+    if fixed.get("world_id") == "unknown_world":
+        world_hint = os.environ.get("MCA_WORLD_ID", "").strip() or "default_world"
+        fixed["world_id"] = stable_fallback_id("world", world_hint)
+    if fixed.get("player_id") == "unknown_player" and player_name:
+        fixed["player_id"] = stable_fallback_id("player", player_name)
+    if fixed.get("character_id") == "unknown_character" and villager_name:
+        profession = extract_current_profession(system_text) or "unknown_profession"
+        fixed["character_id"] = stable_fallback_id("npc", f"{villager_name}:{profession}")
+    return fixed
+
+
+def extract_current_profession(system_text: str) -> str:
+    text = normalize_for_match(system_text)
+    if not text:
+        return ""
+
+    alias_pattern = "|".join(re.escape(alias) for alias in sorted(PROFESSION_ALIASES, key=len, reverse=True))
+    explicit_patterns = [
+        rf"\b(?:profession|job|occupation|career|work|oficio|trabajo|profesion)\s*(?:is|=|:|-)?\s*(?:minecraft:)?({alias_pattern})\b",
+        rf"\b(?:is|as|soy|es|como)\s+(?:a|an|un|una)?\s*(?:minecraft:)?({alias_pattern})\b",
+        rf"\bminecraft:({alias_pattern})\b",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return PROFESSION_ALIASES.get(match.group(1), "")
+
+    found = {
+        PROFESSION_ALIASES[alias]
+        for alias in PROFESSION_ALIASES
+        if re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
+    }
+    if len(found) == 1:
+        return next(iter(found))
+    return ""
+
+
+def current_profession_guidance(system_text: str) -> str:
+    profession = extract_current_profession(system_text)
+    if not profession:
+        return (
+            "Oficio actual: MCA no envio un oficio claro para este aldeano. "
+            "Si el jugador pregunta a que te dedicas, no inventes una profesion concreta; responde que no tienes puesto claro ahora mismo o habla de una tarea comun de la aldea."
+        )
+    details = PROFESSION_DETAILS[profession]
+    return (
+        f"Oficio actual detectado: {details['label']}. "
+        f"Cuando el jugador pregunte a que te dedicas, di ese oficio y usa detalles de {details['activities']}. "
+        "Este oficio actual manda sobre la identidad persistente y sobre recuerdos antiguos si hay conflicto. "
+        "No cambies de oficio ni digas que construyes puentes/obras salvo que ese oficio y el contexto lo justifiquen."
+    )
+
+
 def parse_session_ids(system_text: str) -> dict[str, str]:
     ids = {
         "world_id": "unknown_world",
@@ -1302,26 +1457,10 @@ def life_stage_world_guidance(system_text: str) -> str:
     else:
         hints.append("edad adulta si MCA no marca child/teen/toddler: puede tratar romance, matrimonio, oficio y responsabilidades adultas.")
 
-    profession_hints = [
-        ("mason", "oficio mason/cantero: piensa en piedra, muros, hornos, cinceles, reparar caminos o afilar herramientas."),
-        ("fisherman", "oficio pescador: piensa en redes, anzuelos, peces, barcas y clima."),
-        ("farmer", "oficio granjero: piensa en semillas, cosecha, pan, animales y comida."),
-        ("librarian", "oficio bibliotecario: piensa en libros, mapas, rumores y registros."),
-        ("cleric", "oficio clerigo: piensa en pociones, heridas, rezos y cuidados."),
-        ("cartographer", "oficio cartografo: piensa en mapas, rutas, costas e islas."),
-        ("armorer", "oficio armero: piensa en armaduras, escudos y reparar equipo."),
-        ("weaponsmith", "oficio herrero de armas: piensa en espadas, hachas, filo y defensa."),
-        ("toolsmith", "oficio herrero de herramientas: piensa en picos, palas, hachas y mantenimiento."),
-        ("butcher", "oficio carnicero: piensa en comida, ahumadores y provisiones."),
-        ("leatherworker", "oficio curtidor: piensa en cuero, monturas y armaduras ligeras."),
-        ("shepherd", "oficio pastor: piensa en lana, tintes, ovejas y telas."),
-        ("fletcher", "oficio flechero: piensa en arcos, flechas, plumas y punteria."),
-        ("nitwit", "sin oficio fijo: puede vagar, chismear, evitar trabajo o improvisar excusas."),
-    ]
-    for needle, hint in profession_hints:
-        if needle in text:
-            hints.append(hint)
-            break
+    profession = extract_current_profession(system_text)
+    if profession:
+        details = PROFESSION_DETAILS[profession]
+        hints.append(f"oficio {details['label']}: piensa en {details['activities']}.")
 
     if "it is night" in text:
         hints.append("entorno de noche: puedes mencionar antorchas, cama, patrulla o mobs con cautela.")
@@ -1497,6 +1636,7 @@ def build_instructions(
             + npc_identity
             + " Usala como trasfondo; no la recites como ficha."
         )
+    parts.append(current_profession_guidance(system_text))
     temperament = personality_guidance(system_text)
     if temperament:
         parts.append(temperament)
@@ -1723,6 +1863,9 @@ def clean_self_name_mentions(text: str, villager_name: str, last_user: str) -> s
             fixed,
             flags=re.IGNORECASE,
         )
+        fixed = re.sub(rf"\b{pattern}\s*,\s*{pattern}\b", lambda _match: villager_name, fixed, flags=re.IGNORECASE)
+        fixed = re.sub(rf"[,;:\-]\s*{pattern}\s*([.!?])?\s*$", lambda m: m.group(1) or "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(rf"\b{pattern}\b\s*(?=\b{pattern}\b)", "", fixed, flags=re.IGNORECASE)
     return fixed.strip() or text
 
 
@@ -1906,6 +2049,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = get_messages(payload)
         system_text, input_messages, last_user, villager_name, player_name = split_messages(messages)
         ids = parse_session_ids(system_text)
+        ids = apply_fallback_session_ids(ids, villager_name, player_name, system_text)
         if env_bool("OPENAI_ALLOW_REQUEST_MODEL", False):
             model = str(payload.get("model") or os.environ.get("OPENAI_MODEL", "gpt-5.4-nano"))
         else:
