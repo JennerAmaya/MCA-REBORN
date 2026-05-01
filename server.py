@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "clean-long-messages-20260501"
+CODE_VERSION = "interaction-time-memory-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -224,7 +224,8 @@ MINIMAL_PROMPT = (
     "Si el jugador pregunta que haces o a que te dedicas, responde con tu oficio real detectado; si no hay oficio claro, dilo sin inventar. "
     "No conviertas una tarea aislada, un recuerdo antiguo o una palabra suelta en tu profesion permanente. "
     "Puedes proponer microacciones de rol coherentes con tu oficio, familia o entorno, como pescar, mapear, cocinar, patrullar, abrazar o defender a alguien. "
-    "Si hay noche, lluvia, trueno o peligro en el contexto, reaccionas al entorno; no inventes un monstruo presente como hecho seguro si no aparece en la escena. "
+    "Distingue dia, noche, lluvia y trueno solo si MCA lo envia en el contexto; no inventes que es de noche o que hay peligro si no aparece en la escena. "
+    "Si el jugador acaba de regalarte algo, besarte, abrazarte o contarte un chiste, reacciona a eso con continuidad segun personalidad, relacion, corazones y consentimiento. "
     "Ajusta tono por personalidad, humor, corazones, relacion y ordenes disponibles. "
     "Los rasgos y emociones actuales importan: daltonismo, atletismo, orientacion romantica, miedos, cansancio, enojo, alegria o tristeza deben notarse en tono y detalles, no como lista. "
     "La orientacion romantica afecta a quien puede atraerle o incomodarle; no la conviertas en chiste ni estereotipo. "
@@ -1659,7 +1660,9 @@ def salient_system_context(system_text: str, limit: int) -> str:
         r"\b(?:profession|job|occupation|oficio|trabajo|trait|mood|personality|hearts|gender|male|female)\b",
         r"\b(?:orientation|sexuality|homosexual|bisexual|asexual|heterosexual|gay|lesbian|straight)\b",
         r"\b(?:disease|condition|illness|sick|infected|diabetes|coeliac|celiac|lactose|albinism|heterochromia|dwarfism)\b",
-        r"\b(?:raining|night|thundering|hurt|injured|pregnant)\b",
+        r"\b(?:raining|rainy|night|daytime|daylight|morning|afternoon|noon|dawn|dusk|sunrise|sunset|thundering|hurt|injured|pregnant)\b",
+        r"\b(?:weather|time of day|hora|noche|dia|lluvia|trueno|amanecer|atardecer|anochecer)\b",
+        r"\b(?:gift|gifted|gave|kiss|kissed|hug|hugged|joke|joked|laugh|laughed|interaction|interacted|regalo|regalar|beso|besar|abrazo|abrazar|chiste|broma|risa)\b",
     ]
     profession_aliases = sorted(PROFESSION_ALIASES, key=len, reverse=True)
     for sentence in re.split(r"(?<=[.!?])\s+", raw):
@@ -2294,15 +2297,10 @@ def life_stage_world_guidance(system_text: str) -> str:
         details = PROFESSION_DETAILS[profession]
         hints.append(f"oficio {details['label']}: piensa en {details['activities']}.")
 
-    if "it is night" in text:
-        hints.append("entorno de noche: puedes mencionar antorchas, cama, patrulla o mobs con cautela.")
-    if "it is raining" in text:
-        hints.append("entorno con lluvia: puedes mencionar refugio, barro, techo o herramientas mojadas.")
-    if "it is thundering" in text:
-        hints.append("entorno con trueno: puedes mostrar nervios, urgencia o prudencia.")
+    hints.extend(world_time_weather_hints(system_text))
     if len(hints) <= 1 and "minecraft" not in text:
         return ""
-    return "Guia de edad/oficio/entorno: " + " ".join(hints[:4])
+    return "Guia de edad/oficio/entorno: " + " ".join(hints[:6])
 
 
 def trait_mood_guidance(system_text: str) -> str:
@@ -2447,6 +2445,25 @@ def relationship_temperature_guidance(system_text: str) -> str:
     return ""
 
 
+def world_time_weather_hints(system_text: str) -> list[str]:
+    text = normalize_for_match(system_text)
+    hints: list[str] = []
+    if re.search(r"\b(it is (?:currently )?night|nighttime|midnight|de noche|es noche|la noche)\b", text):
+        hints.append("entorno de noche: puedes mencionar antorchas, cama, patrulla o mobs con cautela.")
+    elif re.search(r"\b(dusk|sunset|atardecer|anochecer)\b", text):
+        hints.append("entorno de atardecer/anochecer: puedes notar que baja la luz y conviene prepararse.")
+    elif re.search(
+        r"\b(it is (?:currently )?day|it is daytime|daytime|daylight|morning|afternoon|noon|sunrise|dawn|sunny|de dia|es de dia|amanecer|mediodia)\b",
+        text,
+    ):
+        hints.append("entorno de dia: actua como si hay luz normal; no hables de dormir o mobs nocturnos salvo que el contexto los mencione.")
+    if re.search(r"\b(it is raining|raining|rainy|rain|llueve|lluvia)\b", text):
+        hints.append("entorno con lluvia: puedes mencionar refugio, barro, techo o herramientas mojadas.")
+    if re.search(r"\b(it is thundering|thundering|thunder|storm|trueno|tormenta)\b", text):
+        hints.append("entorno con trueno: puedes mostrar nervios, urgencia o prudencia.")
+    return hints
+
+
 def response_focus_context(last_user: str, system_text: str) -> str:
     text = normalize_for_match(last_user)
     focus_parts: list[str] = []
@@ -2508,6 +2525,74 @@ def recent_turns_context(turns: list[tuple[str, str]]) -> str:
         "Usala como memoria de continuidad si encaja, sin recitarla completa:\n"
         + "\n".join(lines)
     )
+
+
+def detected_player_interactions(text: str) -> list[tuple[str, str, int]]:
+    match_text = normalize_for_match(text)
+    specs: list[tuple[str, str, str, int]] = [
+        (
+            "regalo",
+            r"\b(regal(?:o|e|aste|ado|ar)|gift(?:ed)?|gave (?:you|him|her)|te di|le di|me diste|ofreci(?:o|ste|endo))\b",
+            "el jugador le regalo u ofrecio algo al aldeano",
+            9,
+        ),
+        (
+            "beso",
+            r"\b(bes(?:o|e|aste|ado|ar)|kiss(?:ed)?|smooch)\b",
+            "hubo o intento un beso con el jugador",
+            9,
+        ),
+        (
+            "abrazo",
+            r"\b(abraz(?:o|e|aste|ado|ar)|hug(?:ged)?)\b",
+            "hubo o intento un abrazo con el jugador",
+            8,
+        ),
+        (
+            "chiste",
+            r"\b(chiste|broma|brome(?:e|aste|amos|o)|joke(?:d)?|laugh(?:ed)?|reimos|risa|gracios[oa])\b",
+            "el jugador conto un chiste o hizo una broma",
+            8,
+        ),
+    ]
+    events: list[tuple[str, str, int]] = []
+    for label, pattern, description, weight in specs:
+        if re.search(pattern, match_text, re.IGNORECASE):
+            events.append((label, description, weight))
+    return events
+
+
+def recent_interaction_context(last_user: str, system_text: str) -> str:
+    source = compact_text(" ".join(part for part in [last_user, system_text] if part), 260)
+    events = detected_player_interactions(source)
+    if not events:
+        return ""
+    descriptions = "; ".join(description for _label, description, _weight in events)
+    return (
+        "Interaccion actual/reciente detectada por MCA: "
+        + descriptions
+        + ". Reacciona ahora a esa interaccion con continuidad; si es regalo agradece o valora segun relacion, "
+        + "si es beso/abrazo respeta edad, orientacion, consentimiento y corazones, y si es chiste responde con humor o incomodidad segun tu personalidad."
+    )
+
+
+def extract_recent_interaction_facts(
+    user_text: str,
+    assistant_text: str = "",
+    system_text: str = "",
+) -> list[tuple[str, int]]:
+    assistant_clean = assistant_message_text(assistant_text)
+    source = compact_text(" ".join(part for part in [user_text, assistant_clean, system_text] if part), 200)
+    events = detected_player_interactions(source)
+    facts: list[tuple[str, int]] = []
+    for label, description, weight in events:
+        facts.append(
+            (
+                f"Interaccion con este jugador ({label}): {description}. Reaccionar en futuras charlas segun relacion, personalidad, corazones y contexto. Detalle: {source}",
+                weight,
+            )
+        )
+    return facts
 
 
 def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[str, int]]:
@@ -3216,6 +3301,9 @@ class Handler(BaseHTTPRequestHandler):
         )
         recall_context = memory_question_context(last_user)
         focus_context = response_focus_context(last_user, system_text)
+        interaction_context = recent_interaction_context(last_user, system_text)
+        if interaction_context:
+            focus_context = " ".join(part for part in [focus_context, interaction_context] if part)
         current_profession = extract_current_profession(system_text)
         facts = filter_facts_for_current_context(
             self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4)),
@@ -3285,6 +3373,8 @@ class Handler(BaseHTTPRequestHandler):
             text, system_text, last_user, player_name, registered_villager_name, commands, requested_command
         )
         text = correct_child_name_confusion(text, registered_player_name, player_child_names)
+        for fact, weight in extract_recent_interaction_facts(last_user, text, system_text):
+            self.server.memory.add_fact(ids, fact, weight)
         for fact, weight in extract_important_facts(last_user, text):
             self.server.memory.add_fact(ids, fact, weight)
             if shared_player_memory:
