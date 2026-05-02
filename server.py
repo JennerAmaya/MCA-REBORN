@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "interaction-time-memory-20260501"
+CODE_VERSION = "family-tree-data-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -1443,16 +1443,20 @@ class FamilyTreeCache:
             re.search(r"\b(tu\s+hij[oa]s?|tus\s+hij[oa]s?|tu\s+bebe|tus\s+bebes)\b", text)
         )
         mentions_spouse = bool(
-            re.search(r"\b(mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer|mi\s+pareja|tu\s+espos[ao]|tu\s+marid[oa]|tu\s+mujer|tu\s+pareja|somos\s+espos[oa]s?|estamos\s+casad[oa]s?|estas\s+casad[oa]|esta\s+casad[oa])\b", text)
+            re.search(r"\b(mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer|mi\s+pareja|mi\s+conyuge|tu\s+espos[ao]|tu\s+marid[oa]|tu\s+mujer|tu\s+pareja|tu\s+conyuge|somos\s+espos[oa]s?|estamos\s+casad[oa]s?|estas\s+casad[oa]|esta\s+casad[oa])\b", text)
         )
         asks_about_spouse = bool(
             re.search(r"\b(qui[eé]n\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|con\s+qui[eé]n\s+estas\s+casad[oa]|con\s+qui[eé]n\s+esta\s+casad[oa]|que\s+opinas\s+de\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|como\s+es\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja)|amas\s+a\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja))\b", text)
         )
+        if not asks_about_spouse:
+            asks_about_spouse = bool(
+                re.search(r"\b(como\s+se\s+llama\s+tu\s+(espos[ao]|marid[oa]|mujer|pareja|conyuge)|quien\s+es\s+tu\s+conyuge|quien\s+es\s+tu\s+marido\s+o\s+esposo)\b", text)
+            )
         asks_relationship = bool(
             re.search(r"\b(que\s+relacion\s+(tenemos|tienes\s+conmigo)|que\s+somos|somos\s+algo|me\s+quieres|me\s+odias|te\s+caigo)\b", text)
         )
         mentions_parent = bool(
-            re.search(r"\b(tu\s+(madre|mama|padre|papa)|mi\s+(madre|mama|padre|papa))\b", text)
+            re.search(r"\b(tu\s+(madre|mama|padre|papa)|tus\s+(padres|papas)|mi\s+(madre|mama|padre|papa)|mis\s+(padres|papas)|cuales\s+son\s+los\s+nombres\s+de\s+tus\s+padres|como\s+se\s+llaman\s+tus\s+padres|quienes\s+son\s+tus\s+padres)\b", text)
         )
         mentions_memory = bool(
             re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text)
@@ -1473,6 +1477,8 @@ class FamilyTreeCache:
             parent_names = [name for name in parent_names if name]
             if parent_names:
                 summary += " Padres del aldeano: " + ", ".join(parent_names) + "."
+            else:
+                summary += " Padres del aldeano: no registrados en el arbol familiar cargado."
         if mentions_shared_child and "No hay hijos compartidos" in summary:
             summary += " Si el jugador dice 'nuestro hijo', corrigelo con naturalidad porque no consta en el arbol."
         if (mentions_shared_child or mentions_player_child) and player_node:
@@ -1480,7 +1486,7 @@ class FamilyTreeCache:
         if asks_about_spouse and ("casado/a o en pareja" in normalize_for_match(summary) or "pareja registrada" in normalize_for_match(summary)):
             summary += " Si pregunta por tu esposo/pareja y el jugador es esa persona, responde con alegria en primera persona, por ejemplo reconociendo 'eres tu'."
         if (mentions_spouse or asks_about_spouse) and "casado/a o en pareja" not in normalize_for_match(summary) and "pareja registrada" not in normalize_for_match(summary):
-            summary += " Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
+            summary += " Pareja/conyuge del aldeano: no registrada en el arbol familiar cargado. Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
         if asks_relationship:
             summary += " Si pregunta por la relacion entre ustedes, combina este arbol familiar con corazones/relacion actual de MCA y no inventes matrimonio si no consta."
         if mentions_memory:
@@ -2488,7 +2494,7 @@ def response_focus_context(last_user: str, system_text: str) -> str:
         focus_parts.append(
             "Enfoque de respuesta: el jugador pregunta por padecimientos, condiciones o rasgos. Usa los rasgos detectados en MCA; no los conviertas en oficio ni los ignores."
         )
-    if re.search(r"\b(familia|arbol|genealogic|hij[oa]s?|espos[ao]|pareja|padre|madre|herman[oa]|abuel[oa])\b", text):
+    if re.search(r"\b(familia|arbol|genealogic|hij[oa]s?|espos[ao]|marid[oa]|conyuge|pareja|padres?|madres?|papas?|madre|herman[oa]|abuel[oa])\b", text):
         focus_parts.append(
             "Enfoque de respuesta: el jugador pregunta por familia. Usa el arbol genealogico cargado, distingue vivos/fallecidos y corrige con naturalidad si el jugador inventa parentescos. Si no hay datos familiares cargados en el contexto, no inventes hijos, padres ni pareja."
         )

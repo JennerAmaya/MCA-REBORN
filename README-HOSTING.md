@@ -126,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "interaction-time-memory-20260501"
+"code_version": "family-tree-data-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -164,3 +164,6 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,
   solo con menos contexto familiar/de aldea.
+- Este repo ya incluye `world_data/MCA-FamilyTree.dat` como copia del mundo
+  actual para Render. Si en Minecraft nacen hijos, mueren aldeanos o cambian
+  matrimonios, reemplaza esa copia y vuelve a desplegar.
