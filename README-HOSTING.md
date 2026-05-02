@@ -126,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "family-relationship-audit-20260501"
+"code_version": "romance-memory-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -144,6 +144,10 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - Con `MCA_MEMORY_BACKEND=redis`, los recuerdos se guardan por
   `world_id + player_id + character_id`; un chiste o charla con un aldeano no
   se mezcla con otro aldeano.
+- `MCA_STORE_RAW_TURNS=true` guarda los ultimos turnos por NPC. Desde
+  `romance-memory-20260501` queda activo por defecto incluso si Render usa
+  SQLite, para que preguntas como "recuerdas lo ultimo que te dije" tengan
+  continuidad.
 - El proxy detecta dia/noche/clima e interacciones como regalos, besos,
   abrazos y chistes solo si MCA las manda en la peticion al endpoint. Si un
   boton default de MCA se resuelve dentro del mod sin llamar al proxy, Python no

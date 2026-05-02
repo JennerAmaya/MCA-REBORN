@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "family-relationship-audit-20260501"
+CODE_VERSION = "romance-memory-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -273,8 +273,7 @@ def env_int(name: str, default: int) -> int:
 
 
 def raw_turn_memory_enabled() -> bool:
-    default = os.environ.get("MCA_MEMORY_BACKEND", "").strip().lower() == "redis"
-    return env_bool("MCA_STORE_RAW_TURNS", default)
+    return env_bool("MCA_STORE_RAW_TURNS", True)
 
 
 def output_token_limit() -> int:
@@ -2654,10 +2653,14 @@ def response_focus_context(last_user: str, system_text: str) -> str:
 
 def memory_question_context(last_user: str) -> str:
     text = normalize_for_match(last_user)
-    if re.search(r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi)\b", text):
+    if re.search(
+        r"\b(que\s+recuerdas\s+de\s+mi|te\s+acuerdas\s+de\s+mi|que\s+sabes\s+de\s+mi|que\s+fue\s+lo\s+ultimo\s+que\s+te\s+(dije|mencione|pregunte|conte)|que\s+fue\s+lo\s+.ltimo\s+que\s+te\s+(dije|mencione|pregunte|conte)|recuerdas\s+lo\s+ultimo|recuerdas\s+lo\s+.ltimo|te\s+acuerdas\s+de\s+lo\s+ultimo|te\s+acuerdas\s+de\s+lo\s+.ltimo|de\s+que\s+hablamos)\b",
+        text,
+    ):
         return (
-            "El jugador pregunta que recuerdas de el: responde con 1-3 recuerdos reales tomados de memoria, "
-            "lore o familia; si falta memoria, admitelo sin inventar hechos concretos."
+            "El jugador pregunta que recuerdas o que fue lo ultimo que hablaron: responde con 1-3 recuerdos reales tomados de memoria, "
+            "conversacion reciente, lore o familia. Si hay una propuesta romantica, cita, beso o acuerdo reciente, mencionalo con claridad. "
+            "Si falta memoria, admitelo sin inventar hechos concretos."
         )
     return ""
 
@@ -2744,6 +2747,50 @@ def extract_recent_interaction_facts(
     return facts
 
 
+def extract_romance_memory_facts(user_text: str, assistant_text: str) -> list[tuple[str, int]]:
+    user_clean = compact_text(user_text, 260)
+    if not user_clean:
+        return []
+    user_match = normalize_for_match(user_clean)
+    proposal_pattern = (
+        r"\b("
+        r"saldrias\s+conmigo|saldr.?as\s+conmigo|saldria\s+conmigo|saldr.?a\s+conmigo|saldras\s+conmigo|salir\s+conmigo|quieres\s+salir\s+conmigo|"
+        r"te\s+gustaria\s+salir\s+conmigo|aceptas\s+salir\s+conmigo|salgamos|"
+        r"tener\s+una\s+cita|ir\s+a\s+una\s+cita|una\s+cita\s+conmigo|date\s+with\s+me|"
+        r"se\s+mi\s+novi[ao]|quieres\s+ser\s+mi\s+novi[ao]|seamos\s+pareja|"
+        r"quiero\s+ser\s+tu\s+pareja|quiero\s+ser\s+tu\s+espos[ao]|casate\s+conmigo"
+        r")\b"
+    )
+    if not re.search(proposal_pattern, user_match, re.IGNORECASE):
+        return []
+
+    assistant_clean = compact_text(assistant_message_text(assistant_text), 220)
+    assistant_match = normalize_for_match(assistant_clean)
+    refused = bool(
+        re.search(
+            r"\b(no|no\s+puedo|no\s+quiero|rechazo|no\s+estaria\s+bien|tengo\s+pareja|estoy\s+casad[oa]|mi\s+espos[ao]|mi\s+marid[oa]|mi\s+mujer)\b",
+            assistant_match,
+        )
+    )
+    accepted = bool(
+        re.search(
+            r"\b(si|s.?|claro|acepto|me\s+encantaria|saldria\s+contigo|saldr.?a\s+contigo|salgamos|quiero|vale|de\s+acuerdo|me\s+gustaria)\b",
+            assistant_match,
+        )
+    ) and not refused
+
+    if accepted:
+        result = "el aldeano acepto o mostro interes en salir/tener una cita con el jugador"
+    elif refused:
+        result = "el aldeano rechazo o puso limites ante la propuesta romantica del jugador"
+    else:
+        result = "el jugador hizo una propuesta romantica o de cita; la respuesta exacta debe recordarse desde la conversacion reciente si esta disponible"
+    detail = f"Jugador: {user_clean}"
+    if assistant_clean:
+        detail += f" | Aldeano: {assistant_clean}"
+    return [(f"Recuerdo romantico con este jugador: {result}. {detail}", 10)]
+
+
 def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[str, int]]:
     text = compact_text(user_text, 260)
     if not text:
@@ -2753,6 +2800,7 @@ def extract_important_facts(user_text: str, assistant_text: str) -> list[tuple[s
         (r"\b(recuerda|recuerdame|no olvides|acuerdate)\b", 10),
         (r"\b(me llamo|mi nombre es|me gusta|odio|amo|tengo miedo|prefiero)\b", 8),
         (r"\b(te amo|te quiero|bes[eoé]|abrazo|casad[oa]|espos[ao]|novi[ao]|prometid[ao]|enamorad[oa]|anillo|boda)\b", 7),
+        (r"\b(saldrias\s+conmigo|saldr.?as\s+conmigo|salir\s+conmigo|quieres\s+salir\s+conmigo|cita\s+conmigo|seamos\s+pareja|se\s+mi\s+novi[ao]|casate\s+conmigo)\b", 10),
         (r"\b(regalo|te di|me diste|diamante|flor|vino|taberna|tesoro)\b", 5),
         (r"\b(chiste|broma|bromee|bromeamos|reimos|reir|risa|gracios[oa]|joke)\b", 7),
         (r"\b(perdon|perd[oó]n|pelea|golpe|traicion|salvaste|rescataste|promet[ií])\b", 6),
@@ -3532,6 +3580,8 @@ class Handler(BaseHTTPRequestHandler):
         )
         text = correct_child_name_confusion(text, registered_player_name, player_child_names)
         for fact, weight in extract_recent_interaction_facts(last_user, text, system_text):
+            self.server.memory.add_fact(ids, fact, weight)
+        for fact, weight in extract_romance_memory_facts(last_user, text):
             self.server.memory.add_fact(ids, fact, weight)
         for fact, weight in extract_important_facts(last_user, text):
             self.server.memory.add_fact(ids, fact, weight)
