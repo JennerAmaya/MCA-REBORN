@@ -126,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "spouse-boundaries-20260501"
+"code_version": "family-relationship-audit-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -170,3 +170,6 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - Si el arbol trae pareja/conyuge viva, el proxy debe incluir su nombre y hacer
   que el NPC rechace coqueteos de otros jugadores. Si la pareja figura
   fallecida, debe tratarla en pasado y no inventar pareja actual.
+- Si el arbol no trae pareja pero si muestra hijos compartidos, el proxy puede
+  mencionar coprogenitores como lazo familiar por hijos, sin inventar que fueron
+  esposos o pareja actual.

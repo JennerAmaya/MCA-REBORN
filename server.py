@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "spouse-boundaries-20260501"
+CODE_VERSION = "family-relationship-audit-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -1374,6 +1374,77 @@ class FamilyTreeCache:
                 alive.append(label)
         return alive, deceased
 
+    def co_parent_ids_for(self, node: dict[str, Any]) -> list[str]:
+        co_parents: list[str] = []
+        own_id = node.get("id")
+        child_ids = set(self.child_ids_for(node))
+        if not own_id or not child_ids:
+            return co_parents
+        for entry_id, other in self.entries.items():
+            if entry_id == own_id:
+                continue
+            if child_ids & set(self.child_ids_for(other)):
+                self.add_unique_id(co_parents, entry_id)
+        return co_parents
+
+    def labeled_co_parent_name(self, co_parent_id: str) -> str:
+        co_parent = self.entries.get(co_parent_id)
+        name = self.display_name(co_parent_id, include_life=True)
+        if not co_parent or not name:
+            return ""
+        gender = self.effective_gender(co_parent)
+        if gender == 2:
+            return f"madre/coprogenitora {name}"
+        if gender == 1:
+            return f"padre/coprogenitor {name}"
+        return f"coprogenitor/a {name}"
+
+    def co_parent_summary_for(self, node: dict[str, Any]) -> str:
+        co_parents = [self.labeled_co_parent_name(entry_id) for entry_id in self.co_parent_ids_for(node)]
+        co_parents = [name for name in co_parents if name]
+        if not co_parents:
+            return ""
+        child_names = [self.display_name(child_id, include_life=True) for child_id in self.child_ids_for(node)]
+        child_names = [name for name in child_names if name]
+        detail = "Coprogenitor/a registrado/a por hijos compartidos: " + ", ".join(co_parents[:3]) + "."
+        if child_names:
+            detail += " Hijos compartidos detectados: " + ", ".join(child_names[:4]) + "."
+        detail += " Esto prueba lazo familiar por hijos, no necesariamente matrimonio o pareja actual."
+        return detail
+
+    def relationship_stats(self) -> dict[str, int]:
+        self.refresh()
+        parent_rows = 0
+        partner_rows = 0
+        alive_partner_rows = 0
+        deceased_partner_rows = 0
+        co_parent_rows = 0
+        relationship_state_rows = 0
+        for node in self.entries.values():
+            if self.parent_ids_for(node):
+                parent_rows += 1
+            partners = self.partner_ids_for(node)
+            if partners:
+                partner_rows += 1
+                for partner_id in partners:
+                    partner = self.entries.get(partner_id)
+                    if partner and partner.get("deceased"):
+                        deceased_partner_rows += 1
+                    elif partner:
+                        alive_partner_rows += 1
+            if self.co_parent_ids_for(node):
+                co_parent_rows += 1
+            if int(node.get("relationship") or 0):
+                relationship_state_rows += 1
+        return {
+            "family_parent_rows": parent_rows,
+            "family_partner_rows": partner_rows,
+            "family_alive_partner_links": alive_partner_rows,
+            "family_deceased_partner_links": deceased_partner_rows,
+            "family_coparent_rows": co_parent_rows,
+            "family_relationship_state_rows": relationship_state_rows,
+        }
+
     def romance_boundary_context(
         self,
         character_id: str | None,
@@ -1549,7 +1620,11 @@ class FamilyTreeCache:
         if asks_about_spouse and ("casado/a o en pareja" in normalize_for_match(summary) or "pareja registrada" in normalize_for_match(summary)):
             summary += " Si pregunta por tu esposo/pareja y el jugador es esa persona, responde con alegria en primera persona, por ejemplo reconociendo 'eres tu'."
         if (mentions_spouse or asks_about_spouse) and "casado/a o en pareja" not in normalize_for_match(summary) and "pareja registrada" not in normalize_for_match(summary):
-            summary += " Pareja/conyuge del aldeano: no registrada en el arbol familiar cargado. Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
+            co_parent_summary = self.co_parent_summary_for(node) if node else ""
+            summary += " Pareja/conyuge del aldeano: no registrada como matrimonio o pareja actual en el arbol familiar cargado."
+            if co_parent_summary:
+                summary += " " + co_parent_summary
+            summary += " Si el jugador afirma matrimonio o pareja, corrigelo con naturalidad porque no consta en el arbol."
         if asks_relationship:
             summary += " Si pregunta por la relacion entre ustedes, combina este arbol familiar con corazones/relacion actual de MCA y no inventes matrimonio si no consta."
         if mentions_memory:
@@ -1575,6 +1650,9 @@ class FamilyTreeCache:
             facts.append("Pareja/conyuge registrada fallecida: " + ", ".join(deceased_partners[:2]) + ".")
         else:
             facts.append("Pareja/conyuge: no registrada en el arbol.")
+            co_parent_summary = self.co_parent_summary_for(node)
+            if co_parent_summary:
+                facts.append(co_parent_summary)
 
         parents = [
             self.labeled_parent_name(parent_id) for parent_id in self.parent_ids_for(node)
@@ -3228,6 +3306,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if path == "/health":
+            family_count = self.server.family.entry_count()
+            family_stats = self.server.family.relationship_stats()
             self.send_json(
                 {
                     "ok": True,
@@ -3244,8 +3324,9 @@ class Handler(BaseHTTPRequestHandler):
                     "max_system_message_chars": max(env_int("MCA_MAX_SYSTEM_MESSAGE_CHARS", 12000), 12000),
                     "max_system_chars": max(env_int("MCA_MAX_SYSTEM_CHARS", 6000), 6000),
                     "instructions_max_chars": max(env_int("MCA_INSTRUCTIONS_MAX_CHARS", 5200), 5200),
-                    "family_entries": self.server.family.entry_count(),
-                    "family_data_loaded": self.server.family.entry_count() > 0,
+                    "family_entries": family_count,
+                    "family_data_loaded": family_count > 0,
+                    **family_stats,
                     "world_data_dir": str(getattr(self.server, "world_data_dir", "")),
                     "village_count": self.server.village.village_count(),
                     "direct_commands_local": env_bool("MCA_DIRECT_COMMANDS_LOCAL", True),
