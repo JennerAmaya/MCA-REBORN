@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "family-tree-data-20260501"
+CODE_VERSION = "spouse-boundaries-20260501"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -1360,6 +1360,69 @@ class FamilyTreeCache:
             return f"esposo/pareja {name}"
         return f"pareja {name}"
 
+    def partner_life_groups_for(self, node: dict[str, Any]) -> tuple[list[str], list[str]]:
+        alive: list[str] = []
+        deceased: list[str] = []
+        for partner_id in self.partner_ids_for(node):
+            partner = self.entries.get(partner_id)
+            label = self.labeled_partner_name(partner_id)
+            if not partner or not label:
+                continue
+            if partner.get("deceased"):
+                deceased.append(label)
+            else:
+                alive.append(label)
+        return alive, deceased
+
+    def romance_boundary_context(
+        self,
+        character_id: str | None,
+        player_id: str | None,
+        last_user: str,
+    ) -> str:
+        text = normalize_for_match(last_user)
+        if not re.search(
+            r"\b(coquet|flirt|ligar|seduc|me\s+gustas|te\s+amo|te\s+quiero|bes(?:o|e|arte|ame)|kiss|abrazame|sal\s+conmigo|casate|quiero\s+ser\s+tu\s+(espos[ao]|pareja)|seamos\s+pareja)\b",
+            text,
+        ):
+            return ""
+        node = self.get(character_id)
+        if not node:
+            return ""
+        partners = self.partner_ids_for(node)
+        alive_partner_ids = [
+            partner_id
+            for partner_id in partners
+            if partner_id in self.entries and not self.entries[partner_id].get("deceased")
+        ]
+        deceased_partner_ids = [
+            partner_id
+            for partner_id in partners
+            if partner_id in self.entries and self.entries[partner_id].get("deceased")
+        ]
+        if player_id and player_id in alive_partner_ids:
+            return (
+                "Limite romantico: el jugador es la pareja/conyuge actual viva del NPC; puede responder con afecto "
+                "segun personalidad, corazones, edad y orientacion."
+            )
+        if alive_partner_ids:
+            labels = [self.labeled_partner_name(partner_id) for partner_id in alive_partner_ids]
+            labels = [label for label in labels if label]
+            return (
+                "Limite romantico: el jugador esta coqueteando o intentando romance, pero el NPC tiene pareja/conyuge actual viva registrada: "
+                + ", ".join(labels[:2])
+                + ". Debe ser leal, rechazar el coqueteo con firmeza y puede mostrarse frio, molesto u hostil si el jugador insiste; no devuelvas besos ni romance."
+            )
+        if deceased_partner_ids:
+            labels = [self.labeled_partner_name(partner_id) for partner_id in deceased_partner_ids]
+            labels = [label for label in labels if label]
+            return (
+                "Limite romantico: el NPC tiene una pareja/conyuge registrada como fallecida: "
+                + ", ".join(labels[:2])
+                + ". No hables de esa persona como viva; puede responder desde duelo, memoria o incomodidad, sin inventar pareja actual."
+            )
+        return ""
+
     def effective_gender(self, node: dict[str, Any]) -> int:
         if node.get("player"):
             return 1
@@ -1505,12 +1568,11 @@ class FamilyTreeCache:
         state = self.RELATIONSHIP_STATES.get(node["relationship"], "estado civil desconocido")
         facts.append(f"{name}: {self.gender_label(node)}, {self.life_status(node)}, {state}.")
 
-        partner_names = [
-            self.labeled_partner_name(partner_id) for partner_id in self.partner_ids_for(node)
-        ]
-        partner_names = [partner for partner in partner_names if partner]
-        if partner_names:
-            facts.append("Pareja/conyuge: " + ", ".join(partner_names[:2]) + ".")
+        alive_partners, deceased_partners = self.partner_life_groups_for(node)
+        if alive_partners:
+            facts.append("Pareja/conyuge actual viva: " + ", ".join(alive_partners[:2]) + ".")
+        elif deceased_partners:
+            facts.append("Pareja/conyuge registrada fallecida: " + ", ".join(deceased_partners[:2]) + ".")
         else:
             facts.append("Pareja/conyuge: no registrada en el arbol.")
 
@@ -2378,7 +2440,10 @@ def trait_mood_guidance(system_text: str) -> str:
 def relationship_roleplay_guidance(family_context: str, system_text: str, player_name: str) -> str:
     text = normalize_for_match(family_context + " " + system_text)
     player = normalize_for_match(player_name)
-    spouse_hint = bool(player and "pareja/conyuge" in text and player in text)
+    spouse_hint = bool(
+        player
+        and (("esposo/pareja " + player) in text or ("esposa/pareja " + player) in text)
+    )
     if not spouse_hint:
         spouse_hint = "married to" in text or "in love with" in text or "engaged with" in text
     has_children = "hijos/as:" in normalize_for_match(family_context)
@@ -2684,13 +2749,14 @@ def build_instructions(
     parts.append(player_rule)
     if focus_context:
         parts.append(focus_context)
-    if family_context:
-        parts.append(
-            family_context
-            + " Usa estos datos con naturalidad solo cuando encajen; no recites todo el arbol de golpe. "
-            + "Si un familiar esta vivo usa 'es/esta'; usa 'fue/estaba' solo cuando figure como fallecido/a. "
-            + "Si hay pareja/conyuge registrada, no digas que estas soltero/a ni que no sabes con quien estas casado/a."
-        )
+        if family_context:
+            parts.append(
+                family_context
+                + " Usa estos datos con naturalidad solo cuando encajen; no recites todo el arbol de golpe. "
+                + "Si un familiar esta vivo usa 'es/esta'; usa 'fue/estaba' solo cuando figure como fallecido/a. "
+                + "Si hay pareja/conyuge actual viva registrada, recuerda su nombre y rechaza coqueteos de terceros con lealtad. "
+                + "Si la pareja registrada esta fallecida, no hables como si estuviera viva ni inventes una pareja actual."
+            )
     if player_lore:
         parts.append(player_lore)
     if mentioned_lore:
@@ -3310,6 +3376,11 @@ class Handler(BaseHTTPRequestHandler):
         interaction_context = recent_interaction_context(last_user, system_text)
         if interaction_context:
             focus_context = " ".join(part for part in [focus_context, interaction_context] if part)
+        romance_boundary = self.server.family.romance_boundary_context(
+            ids.get("character_id"), ids.get("player_id"), last_user
+        )
+        if romance_boundary:
+            focus_context = " ".join(part for part in [focus_context, romance_boundary] if part)
         current_profession = extract_current_profession(system_text)
         facts = filter_facts_for_current_context(
             self.server.memory.essential_facts(ids, env_int("MCA_MAX_MEMORY_FACTS", 4)),

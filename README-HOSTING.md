@@ -126,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "family-tree-data-20260501"
+"code_version": "spouse-boundaries-20260501"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -167,3 +167,6 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - Este repo ya incluye `world_data/MCA-FamilyTree.dat` como copia del mundo
   actual para Render. Si en Minecraft nacen hijos, mueren aldeanos o cambian
   matrimonios, reemplaza esa copia y vuelve a desplegar.
+- Si el arbol trae pareja/conyuge viva, el proxy debe incluir su nombre y hacer
+  que el NPC rechace coqueteos de otros jugadores. Si la pareja figura
+  fallecida, debe tratarla en pasado y no inventar pareja actual.
