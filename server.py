@@ -27,7 +27,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 RECENT_DEBUG_LIMIT = 20
-CODE_VERSION = "romance-memory-20260501"
+CODE_VERSION = "character-profiles-20260504"
 KNOWN_MCA_COMMANDS = {
     "follow-player": "Follow the player talking to you",
     "stay-here": "Stay here for a while",
@@ -2915,7 +2915,12 @@ def build_instructions(
             + "\n".join(f"- {fact}" for fact in player_facts)
         )
     if profile:
-        parts.append("Perfil del aldeano por nombre: " + profile)
+        parts.append(
+            "Perfil extra por nombre del aldeano: "
+            "usalo como capa de roleplay e identidad, pero nunca sobrescribe nombre, familia, oficio, genero, rasgos, humor, relacion, orientacion, recuerdos ni comandos actuales enviados por MCA. "
+            "Integra 1 detalle, vivencia o frase original del perfil solo cuando encaje; no recites la ficha completa. "
+            + profile
+        )
     if npc_identity:
         parts.append(
             "Identidad persistente del aldeano: "

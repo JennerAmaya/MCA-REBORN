@@ -61,8 +61,11 @@ MCA_NPC_IDENTITIES=true
 
 Edita `profiles/characters.json`.
 
-Si un aldeano se llama `Killjoy`, `Ichigo`, `Xokas`, etc., el proxy agrega ese
-perfil al prompt. Usa descripciones de personalidad, no textos largos.
+Si un aldeano se llama `Aurora`, `Chunli`, `Driada`, `Killjoy`, `Ichigo`,
+`Xokas`, etc., el proxy agrega ese perfil al prompt. Usa descripciones de
+personalidad, vivencias y frases originales breves, no textos largos. El perfil
+es solo una capa extra de roleplay: MCA sigue mandando sobre familia, oficio,
+rasgos, humor, relacion, orientacion, memoria y comandos.
 
 ## Lore por jugador
 

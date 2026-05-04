@@ -126,7 +126,7 @@ Para confirmar que Render ya desplego la version que preserva la ficha completa
 de MCA, `/health` debe incluir:
 
 ```json
-"code_version": "romance-memory-20260501"
+"code_version": "character-profiles-20260504"
 ```
 
 Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
@@ -164,6 +164,10 @@ Si falta ese valor, haz `Manual Deploy -> Deploy latest commit` en Render.
 - `MCA_RESPONSE_MAX_CHARS=0` significa no recortar la respuesta en el proxy. Si
   MCA/Minecraft muestran un limite visual, se puede poner un numero aqui para
   cortar al final de una frase.
+- `profiles/characters.json` incluye perfiles extra por nombre para Aurora,
+  Chunli, Driada y Killjoy. Son una capa de identidad/roleplay: no pisan
+  familia, oficio, rasgos, humor, relacion, orientacion, memoria ni comandos
+  actuales enviados por MCA.
 - Si quieres que el proxy lea familia/aldea de MCA, sube copias periodicas de
   `world/data/MCA-FamilyTree.dat` y `world/data/mca_villages.dat` a la carpeta
   indicada por `MCA_WORLD_DATA_DIR`. Sin esos archivos, el chat funciona igual,
